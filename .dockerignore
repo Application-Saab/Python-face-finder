@@ -1,0 +1,15 @@
+.git
+.gitignore
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+*.log
+album/
+album_resized/
+search_results.txt
+sample.png
+sample2.png
+finder.py
+resizer.py
+Dockerfile

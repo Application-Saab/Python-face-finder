@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Face Recognition Server</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🔍 Face Recognition Server</h1>
+            <p>Complete solution for face recognition, image management, and search</p>
+        </header>
+
+        <div class="tabs-container">
+            <div class="tabs">
+                <button class="tab-button active" onclick="switchTab('upload')">📤 Upload</button>
+                <button class="tab-button" onclick="switchTab('search')">🔍 Search</button>
+                <button class="tab-button" onclick="switchTab('albums')">📁 Albums</button>
+            </div>
+
+            <!-- UPLOAD TAB -->
+            <div id="upload" class="tab-content active">
+                <div class="section">
+                    <h2>📤 Upload Images</h2>
+                    <p style="color: #666; margin-bottom: 15px;">Upload images to albums. They will be automatically resized and optimized for face recognition.</p>
+                    
+                    <div id="uploadStatus" class="status-message"></div>
+
+                    <div class="form-group">
+                        <label for="albumNameUpload">Album Name *</label>
+                        <input 
+                            type="text" 
+                            id="albumNameUpload" 
+                            placeholder="e.g., vacation, family, team" 
+                            value="my_album"
+                        >
+                    </div>
+
+                    <div class="form-group">
+                        <label>Select Image File *</label>
+                        <div class="file-input-wrapper">
+                            <input 
+                                type="file" 
+                                id="imageFile" 
+                                accept="image/jpeg,image/png,image/jpg"
+                                onchange="updateFileName()"
+                            >
+                            <label for="imageFile" class="file-input-label" id="fileLabel" ondrop="handleDrop(event)" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)">
+                                <div>📁 Drag and drop image here or click to select</div>
+                                <div style="font-size: 0.9em; margin-top: 5px; color: #666;">Supported: JPG, PNG</div>
+                                <div id="fileName" style="margin-top: 8px; font-weight: bold; color: #667eea; display: none;"></div>
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="button-group">
+                        <button class="btn-primary" onclick="uploadImage()">Upload Image</button>
+                        <button class="btn-secondary" onclick="clearUploadForm()">Clear</button>
+                    </div>
+
+                    <div id="uploadPreview" style="margin-top: 20px; display: none;">
+                        <h3 style="margin-bottom: 10px;">Upload Result:</h3>
+                        <div id="uploadDetails"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- SEARCH TAB -->
+            <div id="search" class="tab-content">
+                <div class="section">
+                    <h2>🔍 Face Recognition Search</h2>
+                    <p style="color: #666; margin-bottom: 15px;">Upload a sample image and search for matching faces across albums.</p>
+
+                    <div id="searchStatus" class="status-message"></div>
+
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px;">
+                        <div class="form-group">
+                            <label>Sample Image (Face to Search) *</label>
+                            <div class="file-input-wrapper">
+                                <input 
+                                    type="file" 
+                                    id="sampleImageFile" 
+                                    accept="image/jpeg,image/png,image/jpg"
+                                    onchange="updateSampleFileName()"
+                                >
+                                <label for="sampleImageFile" class="file-input-label" id="sampleFileLabel" ondrop="handleSampleDrop(event)" ondragover="handleDragOver(event)" ondragleave="handleSampleDragLeave(event)">
+                                    <div>👤 Upload reference face image</div>
+                                    <div style="font-size: 0.9em; margin-top: 5px; color: #666;">JPG, PNG</div>
+                                    <div id="sampleFileName" style="margin-top: 8px; font-weight: bold; color: #667eea; display: none;"></div>
+                                </label>
+                            </div>
+                            <div id="samplePreview" style="margin-top: 10px; display: none;">
+                                <img id="samplePreviewImg" style="max-width: 100%; max-height: 200px; border-radius: 8px; border: 2px solid #667eea;" />
+                            </div>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="searchAlbum">Album to Search *</label>
+                            <input 
+                                type="text" 
+                                id="searchAlbum" 
+                                placeholder="e.g., album_to_search" 
+                                value="my_album"
+                            >
+                            <small style="color: #666;">Album folder to search for matches</small>
+                        </div>
+                    </div>
+
+                    <div class="button-group">
+                        <button class="btn-primary" onclick="startSearch()" id="startSearchBtn">Start Search</button>
+                        <button class="btn-secondary" onclick="stopSearch()" id="stopSearchBtn" disabled>Stop Search</button>
+                        <button class="btn-secondary" onclick="clearSearchForm()">Clear</button>
+                    </div>
+
+                    <div id="searchResults" style="margin-top: 20px;">
+                        <div class="gallery" id="resultsGallery"></div>
+                        <div id="searchSummary" class="summary"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ALBUMS TAB -->
+            <div id="albums" class="tab-content">
+                <div class="section">
+                    <h2>📁 Albums & Images</h2>
+                    <p style="color: #666; margin-bottom: 15px;">Manage your albums and view all images.</p>
+
+                    <div id="albumsStatus" class="status-message"></div>
+
+                    <button class="btn-primary" onclick="loadAlbums()">Refresh Albums</button>
+
+                    <div id="albumsContainer" class="album-list" style="margin-top: 20px;"></div>
+
+                    <h3 style="margin-top: 40px; margin-bottom: 15px;">📸 All Images</h3>
+                    <div id="imagesContainer"></div>
+                </div>
+            </div>
+
+            <!-- STATUS TAB -->
+            <div id="status" class="tab-content">
+                <div class="section">
+                    <h2>📊 Server Status</h2>
+                    <p style="color: #666; margin-bottom: 15px;">Monitor server health and configuration.</p>
+
+                    <button class="btn-primary" onclick="getServerStatus()">Refresh Status</button>
+
+                    <div id="statusContainer" style="margin-top: 20px;"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Image Modal -->
+    <div id="imageModal" class="modal" onclick="closeModal()">
+        <div class="modal-content" onclick="event.stopPropagation()">
+            <span class="modal-close" onclick="closeModal()">&times;</span>
+            <div id="modalContent"></div>
+        </div>
+    </div>
+    <script src="/static/script.js"></script>
+</body>
+</html>

@@ -1,0 +1,207 @@
+Face Recognition Search Results
+========================================
+Reference Image: sample.png
+Search Tolerance: 0.6
+Minimum Confidence: 55.0%
+Total Matches Found: 25
+
+Match 1:
+  File: 3Z9A1528.jpg
+  Full Path: album_resized/3Z9A1528.jpg
+  Confidence: 95.75%
+  Face Distance: 0.0425
+  Face Location: (439, 795, 706, 527)
+  Face Number: 1
+------------------------------
+Match 2:
+  File: IMG_8377.jpg
+  Full Path: album_resized/IMG_8377.jpg
+  Confidence: 64.81%
+  Face Distance: 0.3519
+  Face Location: (266, 736, 489, 513)
+  Face Number: 2
+------------------------------
+Match 3:
+  File: 3Z9A1524.jpg
+  Full Path: album_resized/3Z9A1524.jpg
+  Confidence: 64.31%
+  Face Distance: 0.3569
+  Face Location: (409, 1092, 676, 825)
+  Face Number: 1
+------------------------------
+Match 4:
+  File: IMG_8375.jpg
+  Full Path: album_resized/IMG_8375.jpg
+  Confidence: 63.87%
+  Face Distance: 0.3613
+  Face Location: (415, 786, 638, 563)
+  Face Number: 1
+------------------------------
+Match 5:
+  File: IMG_8405.jpg
+  Full Path: album_resized/IMG_8405.jpg
+  Confidence: 63.00%
+  Face Distance: 0.3700
+  Face Location: (263, 634, 449, 448)
+  Face Number: 2
+------------------------------
+Match 6:
+  File: IMG_8376.jpg
+  Full Path: album_resized/IMG_8376.jpg
+  Confidence: 61.95%
+  Face Distance: 0.3805
+  Face Location: (341, 687, 563, 464)
+  Face Number: 2
+------------------------------
+Match 7:
+  File: IMG_8328.jpg
+  Full Path: album_resized/IMG_8328.jpg
+  Confidence: 60.84%
+  Face Distance: 0.3916
+  Face Location: (307, 1011, 414, 903)
+  Face Number: 1
+------------------------------
+Match 8:
+  File: 3Z9A1526.jpg
+  Full Path: album_resized/3Z9A1526.jpg
+  Confidence: 60.52%
+  Face Distance: 0.3948
+  Face Location: (277, 919, 598, 598)
+  Face Number: 1
+------------------------------
+Match 9:
+  File: IMG_8436.jpg
+  Full Path: album_resized/IMG_8436.jpg
+  Confidence: 59.33%
+  Face Distance: 0.4067
+  Face Location: (366, 985, 552, 799)
+  Face Number: 1
+------------------------------
+Match 10:
+  File: IMG_8403.jpg
+  Full Path: album_resized/IMG_8403.jpg
+  Confidence: 59.31%
+  Face Distance: 0.4069
+  Face Location: (160, 758, 345, 572)
+  Face Number: 1
+------------------------------
+Match 11:
+  File: IMG_8435.jpg
+  Full Path: album_resized/IMG_8435.jpg
+  Confidence: 58.73%
+  Face Distance: 0.4127
+  Face Location: (405, 1001, 494, 912)
+  Face Number: 4
+------------------------------
+Match 12:
+  File: IMG_8331.jpg
+  Full Path: album_resized/IMG_8331.jpg
+  Confidence: 58.65%
+  Face Distance: 0.4135
+  Face Location: (366, 737, 552, 551)
+  Face Number: 3
+------------------------------
+Match 13:
+  File: IMG_8404.jpg
+  Full Path: album_resized/IMG_8404.jpg
+  Confidence: 58.23%
+  Face Distance: 0.4177
+  Face Location: (217, 637, 440, 414)
+  Face Number: 1
+------------------------------
+Match 14:
+  File: IMG_8434.jpg
+  Full Path: album_resized/IMG_8434.jpg
+  Confidence: 57.95%
+  Face Distance: 0.4205
+  Face Location: (375, 1071, 464, 982)
+  Face Number: 3
+------------------------------
+Match 15:
+  File: IMG_8431.jpg
+  Full Path: album_resized/IMG_8431.jpg
+  Confidence: 57.71%
+  Face Distance: 0.4229
+  Face Location: (77, 696, 263, 510)
+  Face Number: 1
+------------------------------
+Match 16:
+  File: IMG_8332.jpg
+  Full Path: album_resized/IMG_8332.jpg
+  Confidence: 57.23%
+  Face Distance: 0.4277
+  Face Location: (290, 706, 558, 438)
+  Face Number: 2
+------------------------------
+Match 17:
+  File: 3Z9A1555.jpg
+  Full Path: album_resized/3Z9A1555.jpg
+  Confidence: 57.17%
+  Face Distance: 0.4283
+  Face Location: (425, 717, 580, 562)
+  Face Number: 2
+------------------------------
+Match 18:
+  File: 3Z9A1551.jpg
+  Full Path: album_resized/3Z9A1551.jpg
+  Confidence: 57.11%
+  Face Distance: 0.4289
+  Face Location: (367, 1584, 474, 1477)
+  Face Number: 4
+------------------------------
+Match 19:
+  File: IMG_8335.jpg
+  Full Path: album_resized/IMG_8335.jpg
+  Confidence: 56.58%
+  Face Distance: 0.4342
+  Face Location: (316, 761, 539, 538)
+  Face Number: 1
+------------------------------
+Match 20:
+  File: 3Z9A1530.jpg
+  Full Path: album_resized/3Z9A1530.jpg
+  Confidence: 56.39%
+  Face Distance: 0.4361
+  Face Location: (439, 557, 706, 290)
+  Face Number: 2
+------------------------------
+Match 21:
+  File: 3Z9A1523.jpg
+  Full Path: album_resized/3Z9A1523.jpg
+  Confidence: 56.20%
+  Face Distance: 0.4380
+  Face Location: (439, 1152, 706, 884)
+  Face Number: 1
+------------------------------
+Match 22:
+  File: 3Z9A1527.jpg
+  Full Path: album_resized/3Z9A1527.jpg
+  Confidence: 56.19%
+  Face Distance: 0.4381
+  Face Location: (348, 954, 669, 633)
+  Face Number: 1
+------------------------------
+Match 23:
+  File: IMG_8333.jpg
+  Full Path: album_resized/IMG_8333.jpg
+  Confidence: 56.11%
+  Face Distance: 0.4389
+  Face Location: (291, 712, 514, 489)
+  Face Number: 1
+------------------------------
+Match 24:
+  File: 3Z9A1529.jpg
+  Full Path: album_resized/3Z9A1529.jpg
+  Confidence: 55.82%
+  Face Distance: 0.4418
+  Face Location: (439, 973, 706, 706)
+  Face Number: 2
+------------------------------
+Match 25:
+  File: 3Z9A1532.jpg
+  Full Path: album_resized/3Z9A1532.jpg
+  Confidence: 55.24%
+  Face Distance: 0.4476
+  Face Location: (384, 990, 705, 669)
+  Face Number: 2
+------------------------------
