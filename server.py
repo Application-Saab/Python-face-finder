@@ -82,7 +82,7 @@ class FaceSearcher:
         self.min_similarity = min_similarity
 
         self.app = FaceAnalysis(
-            name="buffalo_l",
+            name="buffalo_s",
             providers=["CPUExecutionProvider"],
         )
         self.app.prepare(ctx_id=0, det_size=(640, 640))
