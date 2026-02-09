@@ -279,6 +279,11 @@ async def startup_event():
     # 🔥 MongoDB connect
     connect_db()
     print("✅ MongoDB connected")
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return {"status": "ok", "timestamp": ts()}
    
 @app.post("/search")
 async def search_faces_s3(
