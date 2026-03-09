@@ -41,8 +41,8 @@ def ts():
 s3 = boto3.client("s3", region_name=AWS_REGION)
 from concurrent.futures import ThreadPoolExecutor
 
-EXECUTOR = ThreadPoolExecutor(max_workers=4)
-BATCH_SIZE = 4
+EXECUTOR = ThreadPoolExecutor(max_workers=1)
+BATCH_SIZE = 1
 
 
 
@@ -120,9 +120,9 @@ class FaceSearcher:
         )
 
         # Tunables
-        BATCH_SIZE = 5
-        DOWNLOAD_LIMIT = 5
-        SCAN_LIMIT = 5
+        BATCH_SIZE = 1
+        DOWNLOAD_LIMIT = 1
+        SCAN_LIMIT = 1
 
         download_sem = asyncio.Semaphore(DOWNLOAD_LIMIT)
         scan_sem = asyncio.Semaphore(SCAN_LIMIT) 
@@ -185,7 +185,7 @@ class FaceSearcher:
                     print(
                         f"[{ts()}] ✅ Batch-{batch_id} SCAN DONE | "
                         f"{time.perf_counter() - start:.2f}s | "
-                        f"Matches: {len(results)}"
+                        f"Matches NEW ONE -------------------: {len(results)}"
                     )
 
                 return batch_id, results
