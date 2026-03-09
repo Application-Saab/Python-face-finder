@@ -78,7 +78,7 @@ def delete_subfolder_by_id(subfolder_id: str):
 
 
 class FaceSearcher:
-    def __init__(self, min_similarity: float = 0.5):
+    def __init__(self, min_similarity: float = 0.3):
         self.min_similarity = min_similarity
 
         self.app = FaceAnalysis(
@@ -113,15 +113,19 @@ class FaceSearcher:
          yield f"data: ❌ S3 ERROR | {str(e)}\n\n"
          return
 
-        
+        print(
+            f"[{ts()}] 📂 S3 LIST DONE | "
+            f"Images: {len(image_keys)} | "
+            f"{time.perf_counter() - t0:.2f}s"
+        )
 
         # Tunables
         BATCH_SIZE = 5
-        DOWNLOAD_LIMIT = 4
-        SCAN_LIMIT = 4
+        DOWNLOAD_LIMIT = 5
+        SCAN_LIMIT = 5
 
         download_sem = asyncio.Semaphore(DOWNLOAD_LIMIT)
-        scan_sem = asyncio.Semaphore(SCAN_LIMIT)
+        scan_sem = asyncio.Semaphore(SCAN_LIMIT) 
 
          
         batches = [
@@ -129,6 +133,7 @@ class FaceSearcher:
             for i in range(0, len(image_keys), BATCH_SIZE)
         ]
 
+        print(f"[{ts()}] 🧩 Total batches: {len(batches)}")
 
         tasks = []
         match_count = 0
@@ -142,7 +147,10 @@ class FaceSearcher:
             ):
                 # 🔽 DOWNLOAD STAGE
                 async with download_sem:
-                    
+                    print(
+                        f"[{ts()}] 📥 Batch-{batch_id} "
+                        f"S3 DOWNLOAD START"
+                    )
 
                     s3_tasks = [
                         read_s3_image_async(key, loop)
@@ -150,13 +158,19 @@ class FaceSearcher:
                     ]
                     imgs = await asyncio.gather(*s3_tasks)
 
-                    
+                    print(
+                        f"[{ts()}] 📥 Batch-{batch_id} "
+                        f"DOWNLOAD DONE"
+                    )
 
                 batch_imgs = list(zip(keys, imgs))
 
                 
                 async with scan_sem:
-                    
+                    print(
+                        f"[{ts()}] 🔍 Batch-{batch_id} "
+                        f"SCAN START"
+                    )
 
                     start = time.perf_counter()
                     results = await loop.run_in_executor(
@@ -168,7 +182,11 @@ class FaceSearcher:
                         self.min_similarity,
                     )
 
-                    
+                    print(
+                        f"[{ts()}] ✅ Batch-{batch_id} SCAN DONE | "
+                        f"{time.perf_counter() - start:.2f}s | "
+                        f"Matches: {len(results)}"
+                    )
 
                 return batch_id, results
 
