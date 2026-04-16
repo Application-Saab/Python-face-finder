@@ -41,8 +41,7 @@ def ts():
 s3 = boto3.client("s3", region_name=AWS_REGION)
 from concurrent.futures import ThreadPoolExecutor
 
-EXECUTOR = ThreadPoolExecutor(max_workers=1)
-BATCH_SIZE = 1
+EXECUTOR = ThreadPoolExecutor(max_workers=3)
 
 
 
@@ -120,9 +119,9 @@ class FaceSearcher:
         )
 
         # Tunables
-        BATCH_SIZE = 1
-        DOWNLOAD_LIMIT = 1
-        SCAN_LIMIT = 1
+        BATCH_SIZE = 5
+        DOWNLOAD_LIMIT = 4
+        SCAN_LIMIT = 3
 
         download_sem = asyncio.Semaphore(DOWNLOAD_LIMIT)
         scan_sem = asyncio.Semaphore(SCAN_LIMIT) 
@@ -329,7 +328,6 @@ async def search_faces_s3(
 
         faces = searcher.app.get(np.array(img))
         if not faces:
-            delete_subfolder_by_id(subFolderId)
             raise HTTPException(
                 status_code=400,
                 detail="No face found in sample image",
@@ -340,7 +338,6 @@ async def search_faces_s3(
     except HTTPException:
         raise
     except Exception as e:
-        delete_subfolder_by_id(subFolderId)
         raise HTTPException(
             status_code=400,
             detail=f"Error processing sample image: {str(e)}",
