@@ -22,6 +22,8 @@ import json
 from typing import List, Tuple
 from models.weblink import WebLinks
 from models.folders import Folder
+from eventFaceFinder import router as event_router
+
 
 from database import connect_db
 from dotenv import load_dotenv
@@ -56,6 +58,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(event_router)
         
 
 def delete_subfolder_by_id(subfolder_id: str):
