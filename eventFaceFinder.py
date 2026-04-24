@@ -5,7 +5,6 @@ from PIL import Image
 import io
 import asyncio
 import json
-import time
 from datetime import datetime
 from numpy.linalg import norm
 
@@ -24,7 +23,7 @@ AWS_REGION = os.getenv("AWS_REGION", "eu-north-1")
 S3_BUCKET = os.getenv("S3_BUCKET_NAME", "photography-hora")
 
 s3 = boto3.client("s3", region_name=AWS_REGION)
-EXECUTOR = ThreadPoolExecutor(max_workers=1)
+EXECUTOR = ThreadPoolExecutor(max_workers=2)
 
 
 # -------------------------
@@ -52,7 +51,8 @@ def read_s3_image(key):
         obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
         img_bytes = obj["Body"].read()
         return np.array(Image.open(io.BytesIO(img_bytes)).convert("RGB"))
-    except:
+    except Exception as e:
+        print(f"[ERROR] S3 read failed for {key}: {e}")
         return None
 
 
@@ -62,15 +62,18 @@ async def read_s3_async(key, loop):
 
 def process_batch(app, batch, ref_emb, min_sim):
     results = []
+
     for fname, img in batch:
         if img is None:
             continue
 
         faces = app.get(img)
+
         for face in faces:
             sim = np.dot(ref_emb, face.embedding) / (
                 norm(ref_emb) * norm(face.embedding)
             )
+
             if sim >= min_sim:
                 results.append((fname, sim * 100))
 
@@ -88,7 +91,10 @@ def delete_subfolder(eventId, subfolder_id):
 # -------------------------
 class EventFaceSearcher:
     def __init__(self):
-        self.app = FaceAnalysis(name="buffalo_s", providers=["CPUExecutionProvider"])
+        self.app = FaceAnalysis(
+            name="buffalo_s",
+            providers=["CPUExecutionProvider"]
+        )
         self.app.prepare(ctx_id=0, det_size=(640, 640))
         self.min_similarity = 0.3
 
@@ -106,6 +112,7 @@ class EventFaceSearcher:
         for key in image_keys:
             async def task(k=key):
                 img = await read_s3_async(k, loop)
+
                 result = await loop.run_in_executor(
                     EXECUTOR,
                     process_batch,
@@ -114,6 +121,7 @@ class EventFaceSearcher:
                     ref_emb,
                     self.min_similarity
                 )
+
                 return result
 
             tasks.append(asyncio.create_task(task()))
@@ -124,19 +132,26 @@ class EventFaceSearcher:
             for fname, conf in results:
                 match_count += 1
 
-                # ✅ UPDATE eventPosts
+                # Update DB
                 EventPosts.objects(postWebpKey=fname).update_one(
                     add_to_set__folderIds=subFolderId
                 )
 
-                yield f"data: {json.dumps({
-                    'type': 'match',
-                    'file': fname,
-                    'confidence': round(conf, 2),
-                    'matchNo': match_count
-                })}\n\n"
+                data = {
+                    "type": "match",
+                    "file": fname,
+                    "confidence": round(conf, 2),
+                    "matchNo": match_count
+                }
 
-        yield f"data: {json.dumps({'type': 'complete', 'totalMatches': match_count})}\n\n"
+                yield f"data: {json.dumps(data)}\n\n"
+
+        complete_data = {
+            "type": "complete",
+            "totalMatches": match_count
+        }
+
+        yield f"data: {json.dumps(complete_data)}\n\n"
 
 
 searcher = EventFaceSearcher()
@@ -156,15 +171,16 @@ async def event_face_search(
         img = Image.open(io.BytesIO(content)).convert("RGB")
 
         faces = searcher.app.get(np.array(img))
+
         if not faces:
             delete_subfolder(eventId, subFolderId)
-            raise HTTPException(400, "No face found")
+            raise HTTPException(status_code=400, detail="No face found")
 
         ref_emb = faces[0].embedding
 
     except Exception as e:
         delete_subfolder(eventId, subFolderId)
-        raise HTTPException(400, str(e))
+        raise HTTPException(status_code=400, detail=str(e))
 
     prefix = searcher.build_prefix(eventId)
 
