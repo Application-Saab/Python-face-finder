@@ -4,7 +4,8 @@ from mongoengine import (
     StringField,
     ListField,
     EmbeddedDocumentField,
-    DateTimeField
+    DateTimeField,
+    IntField
 )
 from datetime import datetime
 import bson
@@ -15,22 +16,40 @@ import bson
 # ---------------------------
 class FolderDp(EmbeddedDocument):
     fileUrl = StringField(required=True)
+
     thumbnailUrl = StringField(required=True)
+
     s3Key = StringField()
+
     thumbnailKey = StringField()
 
 
 # ---------------------------
 # Embedded: SubFolder
-# (NODE uses _id → we also use _id)
 # ---------------------------
 class SubFolder(EmbeddedDocument):
-    _id = StringField(default=lambda: str(bson.ObjectId()))
-    folderName = StringField(required=True)
-    type = StringField(required=True, choices=["my_photos", "others"])
-    userId = StringField(required=True)
+    _id = StringField(
+        default=lambda: str(bson.ObjectId())
+    )
+
+    folderName = StringField(
+        required=True
+    )
+
+    type = StringField(
+        required=True,
+        choices=["my_photos", "others"]
+    )
+
+    userId = StringField(
+        required=True
+    )
+
     folderDp = EmbeddedDocumentField(FolderDp)
-    createdAt = DateTimeField(default=datetime.utcnow)
+
+    createdAt = DateTimeField(
+        default=datetime.utcnow
+    )
 
 
 # ---------------------------
@@ -40,10 +59,12 @@ class Folder(Document):
     meta = {
         "collection": "folder",
         "indexes": [
+            "viewedBy",
             "customerId",
             "vendorId",
             "eventId",
             "orderId",
+            "subFolders.userId",
             {
                 "fields": ["customerId", "eventId"],
                 "unique": True,
@@ -54,17 +75,45 @@ class Folder(Document):
         ]
     }
 
-    # NODE: _id as string ObjectId
-    id = StringField(primary_key=True, default=lambda: str(bson.ObjectId()))
+    # _id as String ObjectId
+    id = StringField(
+        primary_key=True,
+        default=lambda: str(bson.ObjectId())
+    )
 
-    folderName = StringField(required=True)
+    folderName = StringField(
+        required=True
+    )
 
-    customerId = StringField(required=True)
+    viewedBy = ListField(
+        StringField(),
+        default=list
+    )
+
+    clickCount = IntField(
+        default=0
+    )
+
+    customerId = StringField(
+        required=True
+    )
+
     vendorId = StringField()
+
     eventId = StringField()
+
     orderId = StringField()
 
-    subFolders = ListField(EmbeddedDocumentField(SubFolder), default=list)
+    subFolders = ListField(
+        EmbeddedDocumentField(SubFolder),
+        default=list
+    )
 
-    createdAt = DateTimeField(default=datetime.utcnow)
-    updatedAt = DateTimeField(default=datetime.utcnow)
+    createdAt = DateTimeField(
+        default=datetime.utcnow
+    )
+
+    updatedAt = DateTimeField(
+        default=datetime.utcnow
+    )
+

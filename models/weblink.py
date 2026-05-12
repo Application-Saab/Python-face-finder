@@ -1,39 +1,106 @@
-from mongoengine import Document, StringField, ListField, DateTimeField
+from mongoengine import (
+    Document,
+    StringField,
+    ListField,
+    DateTimeField,
+    IntField
+)
 from datetime import datetime
 import bson
+
 
 class WebLinks(Document):
     meta = {
         "collection": "weblinks",
         "indexes": [
             "mainFolderId",
+            "driveFileId",
             "orderId",
             "orderById",
             "type",
-            "folderIds"
+            "folderIds",
+            "likedBy",
+            {
+                "fields": ["driveFileId", "orderId"],
+                "unique": True
+            }
         ]
     }
 
-    id = StringField(primary_key=True, default=lambda: str(bson.ObjectId()))
+    id = StringField(
+        primary_key=True,
+        default=lambda: str(bson.ObjectId())
+    )
 
-    mainFolderId = StringField(null=True)
+    mainFolderId = StringField(
+        default=""
+    )
 
-    orderId = StringField(required=True)
-    orderById = StringField(required=True)
+    driveFileId = StringField()
+
+    orderId = StringField(
+        required=True
+    )
+
+    fileId = StringField(
+        unique=True,
+    )
+
+    status = StringField(
+        choices=["uploading", "done", "failed"],
+        default="uploading"
+    )
+
+    retryCount = IntField(
+        default=0
+    )
+
+    orderById = StringField()
+
     orderByName = StringField()
 
-    type = StringField(required=True, choices=["image", "video"])
+    type = StringField(
+        choices=["image", "video"],
+        default=""
+    )
 
-    originalUrl = StringField(required=True)
-    originalKey = StringField(required=True, unique=True)
+    originalUrl = StringField()
+
+    # removed unique=True because empty string duplicates cause E11000
+    originalKey = StringField(
+        default=""
+    )
 
     thumbnailImageUrl = StringField()
+
     thumbnailKey = StringField()
 
     videoClipUrl = StringField()
+
     videoClipKey = StringField()
 
-    folderIds = ListField(StringField(), default=list)
+    folderIds = ListField(
+        StringField(),
+        default=list
+    )
 
-    createdAt = DateTimeField(default=datetime.utcnow)
-    updatedAt = DateTimeField(default=datetime.utcnow)
+    likedBy = ListField(
+        StringField(),
+        default=list
+    )
+
+    downloadCount = IntField(
+        default=0
+    )
+
+    shareCount = IntField(
+        default=0
+    )
+
+    createdAt = DateTimeField(
+        default=datetime.utcnow
+    )
+
+    updatedAt = DateTimeField(
+        default=datetime.utcnow
+    )
