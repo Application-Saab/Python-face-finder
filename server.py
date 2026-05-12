@@ -22,12 +22,14 @@ import json
 from typing import List, Tuple
 from models.weblink import WebLinks
 from models.folders import Folder
-from eventFaceFinder import router as event_router
 
 
 from database import connect_db
 from dotenv import load_dotenv
 load_dotenv()
+
+from eventFaceFinder import router as event_router
+
 
 
 

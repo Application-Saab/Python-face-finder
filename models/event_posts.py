@@ -1,6 +1,8 @@
 from mongoengine import Document, StringField, DateTimeField, ListField
 from datetime import datetime
 import bson
+from bson import ObjectId
+from mongoengine import ObjectIdField
 
 class EventPosts(Document):
     meta = {
@@ -15,7 +17,7 @@ class EventPosts(Document):
 
     id = StringField(primary_key=True, default=lambda: str(bson.ObjectId()))
 
-    eventId = StringField(required=True)
+    eventId = ObjectIdField(required=True)
     fileId = StringField(unique=True, sparse=True)
 
     status = StringField(
