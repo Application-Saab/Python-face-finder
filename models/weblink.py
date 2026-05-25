@@ -20,10 +20,14 @@ class WebLinks(Document):
             "type",
             "folderIds",
             "likedBy",
-            {
-                "fields": ["driveFileId", "orderId"],
-                "unique": True
-            }
+           {
+            "fields": ["driveFileId", "orderId"],
+            "unique": True,
+            "partialFilterExpression": {
+               "driveFileId": {"$ne": None},
+               "orderId": {"$ne": None}
+        }
+    }
         ]
     }
 
