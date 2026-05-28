@@ -201,19 +201,26 @@ class FaceSearcher:
         for coro in asyncio.as_completed(tasks):
             batch_id, results = await coro
 
-            for fname, confidence in results:
+            for item in results:
+                doc = item["document"]
+                confidence = item["confidence"]
+
                 match_count += 1
-                WebLinks.objects(thumbnailKey=fname).update_one(
-                add_to_set__folderIds = subFolderId
+
+                WebLinks.objects(
+                    id=doc["_id"]
+                ).update_one(
+                    add_to_set__folderIds=subFolderId
                 )
+                doc["_id"] = str(doc["_id"])
                 payload ={
                     "type": "match",
                     "matchNo": match_count,
                     "batch": batch_id,
-                    "file": fname,
+                    "file": doc,
                     "confidence": float(round(float(confidence), 2))
                 }
-                yield f"data: {json.dumps(payload)}\n\n"
+                yield f"data: {json.dumps(payload, default=str)}\n\n"
 
         complete_payload = {
         "type": "complete",
@@ -290,7 +297,19 @@ def process_image_batch(
                 norm(reference_embedding) * norm(face.embedding)
             )
             if sim >= min_similarity:
-                results.append((filename, sim * 100))
+                print("S3 FILENAME =", filename)
+
+                doc = WebLinks.objects(
+                    thumbnailKey__icontains=filename.split("/")[-1]
+                ).first()
+
+                print("FOUND DOC =", doc)
+
+                if doc:
+                    results.append({
+                        "document": doc.to_mongo().to_dict(),
+                        "confidence": sim * 100
+                    })
     return results
 
 searcher = FaceSearcher()
