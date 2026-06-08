@@ -11,21 +11,22 @@ import bson
 
 class WebLinks(Document):
     meta = {
-        "collection": "weblinks",
-        "indexes": [
-            "mainFolderId",
-            "driveFileId",
-            "orderId",
-            "orderById",
-            "type",
-            "folderIds",
-            "likedBy",
-            {
-                "fields": ["driveFileId", "orderId"],
-                "unique": True
-            }
-        ]
-    }
+    "collection": "weblinks",
+    "auto_create_index": False,
+    "indexes": [
+        "mainFolderId",
+        "driveFileId",
+        "orderId",
+        "orderById",
+        "type",
+        "folderIds",
+        "likedBy",
+        {
+            "fields": ["driveFileId", "orderId"],
+            "unique": True
+        }
+    ]
+}
 
     id = StringField(
         primary_key=True,
