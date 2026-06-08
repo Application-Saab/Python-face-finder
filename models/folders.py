@@ -4,8 +4,11 @@ from mongoengine import (
     StringField,
     ListField,
     EmbeddedDocumentField,
+    EmbeddedDocumentListField,
     DateTimeField,
-    IntField
+    IntField,
+    FloatField,
+    ObjectIdField
 )
 from datetime import datetime
 import bson
@@ -45,9 +48,31 @@ class SubFolder(EmbeddedDocument):
         required=True
     )
 
-    folderDp = EmbeddedDocumentField(FolderDp)
+
+    personCount = IntField(default=0)
+
+    folderDp = EmbeddedDocumentField(
+        FolderDp
+    )
 
     createdAt = DateTimeField(
+        default=datetime.utcnow
+    )
+
+
+# ---------------------------
+# Embedded: DeviceTracking
+# ---------------------------
+class DeviceTracking(EmbeddedDocument):
+    _id = ObjectIdField()
+
+    userId = StringField()
+
+    deviceType = StringField(
+        choices=["ios", "android"]
+    )
+
+    trackedAt = DateTimeField(
         default=datetime.utcnow
     )
 
@@ -57,7 +82,7 @@ class SubFolder(EmbeddedDocument):
 # ---------------------------
 class Folder(Document):
     meta = {
-        "collection": "folder",
+        "collection": "folders",
         "indexes": [
             "viewedBy",
             "customerId",
@@ -65,6 +90,7 @@ class Folder(Document):
             "eventId",
             "orderId",
             "subFolders.userId",
+            "deviceTracking.userId",
             {
                 "fields": ["customerId", "eventId"],
                 "unique": True,
@@ -74,7 +100,7 @@ class Folder(Document):
             }
         ]
     }
-
+    
     # _id as String ObjectId
     id = StringField(
         primary_key=True,
@@ -109,6 +135,19 @@ class Folder(Document):
         default=list
     )
 
+    deviceTracking = EmbeddedDocumentListField(
+        DeviceTracking,
+        default=list
+    )
+
+    version = IntField(
+        db_field="__v",
+        default=0
+    )
+
+    totalPersonCount = IntField(default=0)
+
+
     createdAt = DateTimeField(
         default=datetime.utcnow
     )
@@ -116,4 +155,3 @@ class Folder(Document):
     updatedAt = DateTimeField(
         default=datetime.utcnow
     )
-

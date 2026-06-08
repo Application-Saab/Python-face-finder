@@ -21,7 +21,13 @@ import time
 import json
 from typing import List, Tuple
 from models.weblink import WebLinks
-from models.folders import Folder
+from models.folders import Folder, SubFolder
+import uuid
+from PIL import Image
+import io
+import cv2
+from sklearn.cluster import DBSCAN
+from fastapi import BackgroundTasks
 
 
 from database import connect_db
@@ -384,6 +390,153 @@ async def search_faces_s3(
         searcher.stream_search_batch(s3_prefix, reference_embedding, subFolderId),
         media_type="text/event-stream",
     )
+
+
+
+def cosine_sim(a, b):
+    return float(np.dot(a, b) / (norm(a) * norm(b) + 1e-8))
+
+def process_face_count(folder_name: str):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    try:
+        image_keys = list_s3_images(folder_name)
+
+        if not image_keys:
+            print("No images found")
+            return
+
+        print(f"Total Images: {len(image_keys)}")
+
+        persons = []
+        total_faces_detected = 0
+
+        BATCH_SIZE = 10
+        THRESHOLD = 0.63   # tuned stable value
+
+        batches = [
+            image_keys[i:i + BATCH_SIZE]
+            for i in range(0, len(image_keys), BATCH_SIZE)
+        ]
+
+        for batch_no, keys in enumerate(batches, start=1):
+
+            print(f"\nProcessing Batch {batch_no}/{len(batches)}")
+
+            imgs = loop.run_until_complete(
+                asyncio.gather(
+                    *[read_s3_image_async(k, loop) for k in keys]
+                )
+            )
+
+            for img in imgs:
+                if img is None:
+                    continue
+
+                faces = searcher.app.get(img)
+
+                print(f"Detected faces: {len(faces)}")
+
+                for face in faces:
+
+                    # skip bad detection
+                    if face.embedding is None:
+                        continue
+
+                    if getattr(face, "det_score", 1.0) < 0.65:
+                        continue
+
+                    bbox = face.bbox
+                    w = bbox[2] - bbox[0]
+                    h = bbox[3] - bbox[1]
+
+                    if w < 40 or h < 40:
+                        continue
+
+                    emb = face.normed_embedding.astype(np.float32)
+                    total_faces_detected += 1
+
+                    # -------------------------
+                    # FIND BEST MATCH (IMPORTANT FIX)
+                    # -------------------------
+                    best_sim = 0
+                    best_idx = -1
+
+                    for i, p in enumerate(persons):
+                        sim = np.dot(emb, p["embedding"]) / (
+                            norm(emb) * norm(p["embedding"])
+                        )
+
+                        if sim > best_sim:
+                            best_sim = sim
+                            best_idx = i
+
+                    # -------------------------
+                    # DECIDE MATCH OR NEW PERSON
+                    # -------------------------
+                    if best_sim >= THRESHOLD and best_idx != -1:
+
+                        p = persons[best_idx]
+
+                        # stable centroid update
+                        p["embedding"] = (
+                            (p["embedding"] * p["count"]) + emb
+                        ) / (p["count"] + 1)
+
+                        p["count"] += 1
+
+                    else:
+                        persons.append({
+                            "embedding": emb.copy(),
+                            "count": 1
+                        })
+
+        print("\n================")
+        print("TOTAL FACES:", total_faces_detected)
+        print("UNIQUE PERSONS:", len(persons))
+        print("================")
+
+        # -------------------------
+        # SAVE TO DB
+        # -------------------------
+        folder_doc = Folder.objects(folderName=folder_name).first()
+
+        if folder_doc:
+            folder_doc.totalPersonCount = len(persons)
+            folder_doc.totalFacesDetected = total_faces_detected
+            folder_doc.updatedAt = datetime.utcnow()
+            folder_doc.save()
+
+        return {
+            "success": True,
+            "totalFaces": total_faces_detected,
+            "uniquePersons": len(persons)
+        }
+
+    finally:
+        loop.close()
+
+
+# -----------------------------
+# FASTAPI ENDPOINT (UNCHANGED)
+# -----------------------------
+@app.post("/count-unique-persons")
+async def count_unique_persons(
+    background_tasks: BackgroundTasks,
+    folder_name: str = Form(...)
+):
+    try:
+        background_tasks.add_task(process_face_count, folder_name)
+
+        return {
+            "success": True,
+            "message": "Face processing started in background"
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 # Serve index.html at root
 @app.get("/", response_class=HTMLResponse)
