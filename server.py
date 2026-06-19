@@ -379,6 +379,7 @@ def cosine_sim(a, b):
 # MAIN PROCESS FUNCTION
 # -----------------------------
 def process_face_count(folder_name: str):
+    print(f"STARTING FACE PROCESSING: {folder_name}")
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -485,6 +486,7 @@ def process_face_count(folder_name: str):
         # -------------------------
         folder_doc = Folder.objects(folderName=folder_name).first()
 
+        print("DB SAVE START")
         if folder_doc:
             folder_doc.totalPersonCount = len(persons)
             folder_doc.totalFacesDetected = total_faces_detected
@@ -519,6 +521,362 @@ async def count_unique_persons(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+
+
+
+
+def upload_face_crop(face_crop, folder_id, person_id):
+    buffer = io.BytesIO()
+
+    Image.fromarray(face_crop).save(
+        buffer,
+        format="WEBP",
+        quality=90
+    )
+
+    buffer.seek(0)
+
+    crop_key = f"face-groups/{folder_id}/{person_id}.webp"
+
+    s3.upload_fileobj(
+        buffer,
+        S3_BUCKET,
+        crop_key,
+        ExtraArgs={"ContentType": "image/webp"}
+    )
+
+    crop_url = (
+        f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{crop_key}"
+    )
+
+    return crop_key, crop_url
+
+
+
+
+
+def cosine(a, b):
+    a = np.array(a)
+    b = np.array(b)
+
+    denom = (norm(a) * norm(b))
+    if denom == 0:
+        return 0.0
+
+    return float(np.dot(a, b) / denom)
+
+
+
+
+
+
+@app.post("/count-unique-persons4")
+async def count_unique_persons(
+    folder_name: str = Form(...),
+    folderId: str = Form(...),
+    userId: str = Form(...)
+):
+    try:
+
+        def get_s3_url(key):
+            if not key:
+                return None
+
+            return (
+                f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{key}"
+            )
+
+        loop = asyncio.get_running_loop()
+        image_keys = list_s3_images(folder_name)
+
+        if not image_keys:
+            return {
+                "success": False,
+                "message": "No images found"
+            }
+
+        persons = []
+        BATCH_SIZE = 10
+
+        batches = [
+            image_keys[i:i + BATCH_SIZE]
+            for i in range(0, len(image_keys), BATCH_SIZE)
+        ]
+
+        total_faces = 0
+
+        for keys in batches:
+
+            imgs = await asyncio.gather(*[
+                read_s3_image_async(k, loop)
+                for k in keys
+            ])
+
+            for img, key in zip(imgs, keys):
+
+                if img is None:
+                    continue
+
+                faces = searcher.app.get(img)
+
+                if not faces:
+                    continue
+
+                total_faces += len(faces)
+
+                for face in faces:
+
+                    emb = face.embedding
+                    matched_person = None
+
+                    for person in persons:
+
+                        sim = cosine(
+                            emb,
+                            person["embedding"]
+                        )
+
+                        if sim >= 0.45:
+                            matched_person = person
+                            break
+
+                    if matched_person:
+
+                        matched_person["count"] += 1
+                        matched_person["images"].append(key)
+
+                        matched_person["embedding"] = (
+                            matched_person["embedding"]
+                            * (matched_person["count"] - 1)
+                            + emb
+                        ) / matched_person["count"]
+
+                    else:
+
+                        person_id = str(uuid.uuid4())
+
+                        x1, y1, x2, y2 = map(int, face.bbox)
+
+                        # face size
+                        face_w = x2 - x1
+                        face_h = y2 - y1
+
+                        # sirf 20% padding
+                        pad_x = int(face_w * 0.20)
+                        pad_y = int(face_h * 0.20)
+
+                        h, w = img.shape[:2]
+
+                        crop_x1 = max(0, x1 - pad_x)
+                        crop_y1 = max(0, y1 - pad_y)
+
+                        crop_x2 = min(w, x2 + pad_x)
+                        crop_y2 = min(h, y2 + pad_y)
+
+                        face_crop = img[crop_y1:crop_y2, crop_x1:crop_x2]
+
+                        print(
+                            f"FACE BBOX=({x1},{y1},{x2},{y2}) "
+                            f"CROP SIZE={face_crop.shape}"
+                        )
+
+                        crop_key, crop_url = upload_face_crop(
+                           face_crop,
+                           folderId,
+                           person_id
+                        )
+
+                        persons.append({
+                           "person_id": person_id,
+                           "embedding": emb.copy(),
+                           "count": 1,
+                           "images": [key],
+                           "faceKey": crop_key,
+                           "faceUrl": crop_url
+                        })
+
+        print("All folders count =", Folder.objects.count())
+
+        folder_doc = Folder.objects(
+            id=folderId
+        ).first()
+
+        print("Folder Found =", folder_doc)
+
+        if not folder_doc:
+            raise HTTPException(
+                status_code=404,
+                detail="Folder not found"
+            )
+
+        created_subfolders = []
+
+        for index, person in enumerate(persons):
+
+            sample_image_key = (
+                person["images"][0]
+                if person["images"]
+                else None
+            )
+
+            sample_image_url = get_s3_url(
+                sample_image_key
+            ) if sample_image_key else None
+
+            subfolder = SubFolder(
+                folderName=f"Person {index + 1}",
+                type="others",
+                userId=userId,
+                personId=person["person_id"],
+                personCount=person["count"],
+                folderDp={
+                    "fileUrl": person["faceUrl"],
+                    "thumbnailUrl": person["faceUrl"],
+                    "s3Key": person["faceKey"],
+                    "thumbnailKey": person["faceKey"]
+                } if sample_image_key else None
+            )
+
+            folder_doc.subFolders.append(subfolder)
+
+            created_subfolders.append({
+                "subFolderId": str(subfolder._id),
+                "personId": person["person_id"],
+                "sampleImage": person["faceUrl"],
+                "sampleImageKey": person["faceKey"]
+            })
+
+            folder_doc.uniqueFaceCount = len(persons)
+
+            print(
+                f"👥 Unique Face Count = "
+                f"{folder_doc.uniqueFaceCount}"
+            )
+
+            
+        print(
+            f"💾 Saving Folder With "
+            f"{len(folder_doc.subFolders)} SubFolders"
+        )
+
+        folder_doc.save()
+
+         
+        print("✅ Folder Saved Successfully")
+
+        # =====================================================
+        # TAG ALL PERSON IMAGES WITH THEIR CREATED SUBFOLDER ID
+        # =====================================================
+
+        print("\n🚀 STARTING IMAGE TAGGING PROCESS")
+
+        for i, person in enumerate(persons):
+
+            sub_folder_id = created_subfolders[i]["subFolderId"]
+
+            print(
+                f"\n📁 Person {person['person_id']} "
+                f"-> SubFolder {sub_folder_id}"
+            )
+
+            tagged_count = 0
+
+            for image_key in person["images"]:
+
+                try:
+
+                    filename = image_key.split("/")[-1]
+
+                    docs = WebLinks.objects(
+                        thumbnailKey__icontains=filename
+                    )
+
+                    print(f"\n🔍 Searching filename={filename}")
+                    print(f"📄 Matches Found={docs.count()}")
+
+                    if docs.count() == 0:
+                        print(
+                            f"⚠️ No WebLinks Found For {filename}"
+                        )
+                        continue
+
+                    print("✅ ENTERING UPDATE LOOP")
+
+                    for doc in docs:
+
+                        print(
+                            f"📄 Updating Doc ID={doc.id}"
+                        )
+
+                        result = WebLinks.objects(
+                            id=doc.id
+                        ).update_one(
+                            add_to_set__folderIds=sub_folder_id
+                        )
+
+                        print(
+                            f"✅ Update Result={result}"
+                        )
+
+                        updated_doc = WebLinks.objects(
+                            id=doc.id
+                        ).first()
+
+                        print(
+                            f"📂 FolderIds After Update = "
+                            f"{updated_doc.folderIds}"
+                        )
+
+                        tagged_count += 1
+
+                        print(
+                            f"✅ Tagged Image: {filename}"
+                        )
+
+                except Exception as e:
+
+                    print(
+                        f"❌ Failed Tagging "
+                        f"{image_key}: {str(e)}"
+                    )
+
+            print(
+                f"🎯 Total Tagged For Person: "
+                f"{tagged_count}"
+            )
+
+        print("\n✅ IMAGE TAGGING COMPLETED")
+
+
+        
+
+        return {
+            "success": True,
+            "totalPhotos": len(image_keys),
+            "totalFaceDetections": total_faces,
+            "uniquePersons": len(persons),
+            "subFoldersCreated": len(created_subfolders),
+            "groups": [
+                {
+                    "person_id": p["person_id"],
+                    "count": p["count"],
+                    "subFolderId": created_subfolders[i]["subFolderId"],
+                    "sampleImage": created_subfolders[i]["sampleImage"],
+                    "sampleImageKey": created_subfolders[i]["sampleImageKey"]
+                }
+                for i, p in enumerate(persons)
+            ]
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
 
 
 # Serve index.html at root

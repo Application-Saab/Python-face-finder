@@ -8,7 +8,8 @@ from mongoengine import (
     DateTimeField,
     IntField,
     FloatField,
-    ObjectIdField
+    ObjectIdField,
+    BooleanField
 )
 from datetime import datetime
 import bson
@@ -35,30 +36,26 @@ class SubFolder(EmbeddedDocument):
         default=lambda: str(bson.ObjectId())
     )
 
-    folderName = StringField(
-        required=True
-    )
+    folderName = StringField(required=True)
 
     type = StringField(
         required=True,
         choices=["my_photos", "others"]
     )
 
-    userId = StringField(
-        required=True
-    )
+    userId = StringField(required=True)
 
+    personId = StringField()   # <-- ADD THIS
+
+    isLocker = BooleanField(default=False)
 
     personCount = IntField(default=0)
 
-    folderDp = EmbeddedDocumentField(
-        FolderDp
-    )
+    folderDp = EmbeddedDocumentField(FolderDp)
 
     createdAt = DateTimeField(
         default=datetime.utcnow
     )
-
 
 # ---------------------------
 # Embedded: DeviceTracking
@@ -122,6 +119,10 @@ class Folder(Document):
 
     customerId = StringField(
         required=True
+    )
+
+    shareCapsuleCount = IntField(
+    default=0
     )
 
     vendorId = StringField()
