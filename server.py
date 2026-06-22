@@ -379,17 +379,20 @@ def cosine_sim(a, b):
 # MAIN PROCESS FUNCTION
 # -----------------------------
 def process_face_count(folder_name: str):
+    print(f"STARTED PROCESSING -----------")
+    print(f"FOLDER NAME = {folder_name}")
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     try:
+        print(f"[{folder_name}] Fetching images from S3...")
         image_keys = list_s3_images(folder_name)
 
         if not image_keys:
-            print("No images found")
+            print(f"[{folder_name}] No images found")
             return
 
-        print(f"Total Images: {len(image_keys)}")
+        print(f"[{folder_name}] Total Images Found = {len(image_keys)}")
 
         persons = []
         total_faces_detected = 0
@@ -411,12 +414,18 @@ def process_face_count(folder_name: str):
                     *[read_s3_image_async(k, loop) for k in keys]
                 )
             )
+            print(
+                f"[{folder_name}] Batch {batch_no} "
+                f"Downloaded {len(imgs)} images"
+            )
 
             for img in imgs:
                 if img is None:
                     continue
-
+                
+                print(f"[{folder_name}] Running face detection...")
                 faces = searcher.app.get(img)
+                print(f"[{folder_name}] Face detection completed")
 
                 print(f"Detected faces: {len(faces)}")
 
@@ -480,6 +489,11 @@ def process_face_count(folder_name: str):
         print("UNIQUE PERSONS:", len(persons))
         print("================")
 
+        print(
+            f"[{folder_name}] "
+            f"Updating MongoDB..."
+        )
+
         # -------------------------
         # SAVE TO DB
         # -------------------------
@@ -489,7 +503,14 @@ def process_face_count(folder_name: str):
             folder_doc.totalPersonCount = len(persons)
             folder_doc.totalFacesDetected = total_faces_detected
             folder_doc.updatedAt = datetime.utcnow()
+            print(f"[{folder_name}] Before Mongo Save")
             folder_doc.save()
+            print(f"[{folder_name}] After Mongo Save")
+
+            print(
+                f"[{folder_name}] "
+                f"MongoDB Updated Successfully"
+            )
 
         return {
             "success": True,
@@ -510,6 +531,8 @@ async def count_unique_persons(
     folder_name: str = Form(...)
 ):
     try:
+        print("API HIT")
+        print(f"FOLDER NAME = {folder_name}")
         background_tasks.add_task(process_face_count, folder_name)
 
         return {
@@ -518,6 +541,10 @@ async def count_unique_persons(
         }
 
     except Exception as e:
+        print("[API ERROR]")
+        print(f"FOLDER NAME = {folder_name}")
+        print(str(e))
+        
         raise HTTPException(status_code=500, detail=str(e))
 
 
