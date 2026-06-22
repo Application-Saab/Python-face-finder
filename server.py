@@ -570,9 +570,25 @@ def cosine(a, b):
     return float(np.dot(a, b) / denom)
 
 
-
-
-
+def is_image_blurry(face_img, threshold=65.0):
+    """
+    Strict Laplacian Variance Check.
+    Higher threshold (65.0) ensures only sharp, high-quality front faces pass.
+    """
+    try:
+        if face_img is None or face_img.size == 0:
+            return True
+        if len(face_img.shape) == 3:
+            gray = cv2.cvtColor(face_img, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = face_img
+            
+        variance = cv2.Laplacian(gray, cv2.CV_64F).var()
+        print(f"🔍 Quality Check -> Sharpness Variance: {variance:.2f}")
+        return variance < threshold
+    except Exception as e:
+        print(f"Error checking blur: {e}")
+        return False
 
 @app.post("/count-unique-persons4")
 async def count_unique_persons(
@@ -581,23 +597,16 @@ async def count_unique_persons(
     userId: str = Form(...)
 ):
     try:
-
         def get_s3_url(key):
             if not key:
                 return None
-
-            return (
-                f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{key}"
-            )
+            return f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{key}"
 
         loop = asyncio.get_running_loop()
         image_keys = list_s3_images(folder_name)
 
         if not image_keys:
-            return {
-                "success": False,
-                "message": "No images found"
-            }
+            return {"success": False, "message": "No images found"}
 
         persons = []
         BATCH_SIZE = 10
@@ -610,89 +619,108 @@ async def count_unique_persons(
         total_faces = 0
 
         for keys in batches:
-
             imgs = await asyncio.gather(*[
                 read_s3_image_async(k, loop)
                 for k in keys
             ])
 
             for img, key in zip(imgs, keys):
-
                 if img is None:
                     continue
 
                 faces = searcher.app.get(img)
-
                 if not faces:
                     continue
 
-                total_faces += len(faces)
-
                 for face in faces:
+                    # =========================================================
+                    # RULE 1: STRICT PURE FRONT FACE FILTER (LANDMARKS RATIO)
+                    # =========================================================
+                    if hasattr(face, 'kps') and face.kps is not None:
+                        kps = face.kps
+                        left_eye_x = kps[0][0]
+                        right_eye_x = kps[1][0]
+                        nose_x = kps[2][0]
+                        
+                        eye_distance = abs(right_eye_x - left_eye_x)
+                        
+                        if eye_distance > 0:
+                            ratio = abs(nose_x - left_eye_x) / eye_distance
+                            # Perfect front face ka ratio exactly 0.5 ke paas hota hai.
+                            # Strict Range (0.32 to 0.68) - Iske bahar ka koi bhi side angle skip ho jayega.
+                            if ratio < 0.32 or ratio > 0.68:
+                                print(f"🚫 Dropped Side Profile Face (Ratio: {ratio:.2f}) in image: {key}")
+                                continue
+                        else:
+                            # Agar dono aankhein sahi se visible nahi hain toh drop karo
+                            continue
 
+                    # =========================================================
+                    # RULE 2: HIGH CONFIDENCE FILTER
+                    # =========================================================
+                    det_score = getattr(face, 'det_score', 1.0)
+                    if det_score < 0.75:  # Only allow highly confident, clear detections
+                        print(f"🚫 Dropped Low Confidence Face (Score: {det_score:.2f})")
+                        continue
+
+                    # Setup for Matching
                     emb = face.embedding
                     matched_person = None
+                    max_sim = -1
 
                     for person in persons:
+                        for saved_emb in person["embeddings_list"]:
+                            sim = cosine(emb, saved_emb)
+                            if sim > max_sim:
+                                max_sim = sim
+                                if sim >= 0.45:  # Confirmed match threshold
+                                    matched_person = person
 
-                        sim = cosine(
-                            emb,
-                            person["embedding"]
-                        )
+                    # Crop Face for Quality/Blur verification
+                    x1, y1, x2, y2 = map(int, face.bbox)
+                    face_w, face_h = x2 - x1, y2 - y1
+                    pad_x, pad_y = int(face_w * 0.20), int(face_h * 0.20)
+                    h, w = img.shape[:2]
+                    
+                    crop_x1 = max(0, x1 - pad_x)
+                    crop_y1 = max(0, y1 - pad_y)
+                    crop_x2 = min(w, x2 + pad_x)
+                    crop_y2 = min(h, y2 + pad_y)
+                    face_crop = img[crop_y1:crop_y2, crop_x1:crop_x2]
 
-                        if sim >= 0.45:
-                            matched_person = person
-                            break
-
+                    # IF MATCH FOUND: Add to existing person group
                     if matched_person:
-
                         matched_person["count"] += 1
                         matched_person["images"].append(key)
+                        
+                        # Only feed clean, super sharp front angles into anchor list
+                        if det_score > 0.80 and len(matched_person["embeddings_list"]) < 5:
+                            if not is_image_blurry(face_crop, threshold=60.0):
+                                matched_person["embeddings_list"].append(emb.copy())
 
-                        matched_person["embedding"] = (
-                            matched_person["embedding"]
-                            * (matched_person["count"] - 1)
-                            + emb
-                        ) / matched_person["count"]
-
+                    # IF NO MATCH FOUND: Try creating a new clean folder
                     else:
+                        # =========================================================
+                        # RULE 3: STRICT BLUR CHECK ON NEW FOLDER CREATION
+                        # =========================================================
+                        if is_image_blurry(face_crop, threshold=65.0):
+                            print(f"🚫 Dropped Folder Creation: Face is Blurry/Low-res in image: {key}")
+                            continue
 
+                        # Strict entry filter for new identities
+                        if det_score < 0.78:
+                            print(f"⚠️ Skipped cluster generation for weak face metrics ({det_score:.2f})")
+                            continue
+
+                        total_faces += 1
                         person_id = str(uuid.uuid4())
+                        print(f"📸 [NEW FOLDER] Creating Clear Front Group - Score={det_score:.2f} Image={key}")
 
-                        x1, y1, x2, y2 = map(int, face.bbox)
-
-                        # face size
-                        face_w = x2 - x1
-                        face_h = y2 - y1
-
-                        # sirf 20% padding
-                        pad_x = int(face_w * 0.20)
-                        pad_y = int(face_h * 0.20)
-
-                        h, w = img.shape[:2]
-
-                        crop_x1 = max(0, x1 - pad_x)
-                        crop_y1 = max(0, y1 - pad_y)
-
-                        crop_x2 = min(w, x2 + pad_x)
-                        crop_y2 = min(h, y2 + pad_y)
-
-                        face_crop = img[crop_y1:crop_y2, crop_x1:crop_x2]
-
-                        print(
-                            f"FACE BBOX=({x1},{y1},{x2},{y2}) "
-                            f"CROP SIZE={face_crop.shape}"
-                        )
-
-                        crop_key, crop_url = upload_face_crop(
-                           face_crop,
-                           folderId,
-                           person_id
-                        )
+                        crop_key, crop_url = upload_face_crop(face_crop, folderId, person_id)
 
                         persons.append({
                            "person_id": person_id,
-                           "embedding": emb.copy(),
+                           "embeddings_list": [emb.copy()],
                            "count": 1,
                            "images": [key],
                            "faceKey": crop_key,
@@ -700,33 +728,15 @@ async def count_unique_persons(
                         })
 
         print("All folders count =", Folder.objects.count())
-
-        folder_doc = Folder.objects(
-            id=folderId
-        ).first()
-
-        print("Folder Found =", folder_doc)
+        folder_doc = Folder.objects(id=folderId).first()
 
         if not folder_doc:
-            raise HTTPException(
-                status_code=404,
-                detail="Folder not found"
-            )
+            raise HTTPException(status_code=404, detail="Folder not found")
 
         created_subfolders = []
 
         for index, person in enumerate(persons):
-
-            sample_image_key = (
-                person["images"][0]
-                if person["images"]
-                else None
-            )
-
-            sample_image_url = get_s3_url(
-                sample_image_key
-            ) if sample_image_key else None
-
+            sample_image_key = person["images"][0] if person["images"] else None
             subfolder = SubFolder(
                 folderName=f"Person {index + 1}",
                 type="others",
@@ -740,7 +750,6 @@ async def count_unique_persons(
                     "thumbnailKey": person["faceKey"]
                 } if sample_image_key else None
             )
-
             folder_doc.subFolders.append(subfolder)
 
             created_subfolders.append({
@@ -750,109 +759,28 @@ async def count_unique_persons(
                 "sampleImageKey": person["faceKey"]
             })
 
-            folder_doc.uniqueFaceCount = len(persons)
-
-            print(
-                f"👥 Unique Face Count = "
-                f"{folder_doc.uniqueFaceCount}"
-            )
-
-            
-        print(
-            f"💾 Saving Folder With "
-            f"{len(folder_doc.subFolders)} SubFolders"
-        )
-
+        folder_doc.uniqueFaceCount = len(persons)
         folder_doc.save()
-
-         
-        print("✅ Folder Saved Successfully")
+        print("✅ Folder Database Setup Success")
 
         # =====================================================
         # TAG ALL PERSON IMAGES WITH THEIR CREATED SUBFOLDER ID
         # =====================================================
-
         print("\n🚀 STARTING IMAGE TAGGING PROCESS")
-
         for i, person in enumerate(persons):
-
             sub_folder_id = created_subfolders[i]["subFolderId"]
-
-            print(
-                f"\n📁 Person {person['person_id']} "
-                f"-> SubFolder {sub_folder_id}"
-            )
-
-            tagged_count = 0
-
             for image_key in person["images"]:
-
                 try:
-
                     filename = image_key.split("/")[-1]
-
-                    docs = WebLinks.objects(
-                        thumbnailKey__icontains=filename
-                    )
-
-                    print(f"\n🔍 Searching filename={filename}")
-                    print(f"📄 Matches Found={docs.count()}")
-
-                    if docs.count() == 0:
-                        print(
-                            f"⚠️ No WebLinks Found For {filename}"
-                        )
-                        continue
-
-                    print("✅ ENTERING UPDATE LOOP")
-
+                    docs = WebLinks.objects(thumbnailKey__icontains=filename)
                     for doc in docs:
-
-                        print(
-                            f"📄 Updating Doc ID={doc.id}"
-                        )
-
-                        result = WebLinks.objects(
-                            id=doc.id
-                        ).update_one(
+                        WebLinks.objects(id=doc.id).update_one(
                             add_to_set__folderIds=sub_folder_id
                         )
-
-                        print(
-                            f"✅ Update Result={result}"
-                        )
-
-                        updated_doc = WebLinks.objects(
-                            id=doc.id
-                        ).first()
-
-                        print(
-                            f"📂 FolderIds After Update = "
-                            f"{updated_doc.folderIds}"
-                        )
-
-                        tagged_count += 1
-
-                        print(
-                            f"✅ Tagged Image: {filename}"
-                        )
-
                 except Exception as e:
-
-                    print(
-                        f"❌ Failed Tagging "
-                        f"{image_key}: {str(e)}"
-                    )
-
-            print(
-                f"🎯 Total Tagged For Person: "
-                f"{tagged_count}"
-            )
+                    print(f"❌ Failed Tagging {image_key}: {str(e)}")
 
         print("\n✅ IMAGE TAGGING COMPLETED")
-
-
-        
 
         return {
             "success": True,
@@ -864,20 +792,16 @@ async def count_unique_persons(
                 {
                     "person_id": p["person_id"],
                     "count": p["count"],
-                    "subFolderId": created_subfolders[i]["subFolderId"],
-                    "sampleImage": created_subfolders[i]["sampleImage"],
-                    "sampleImageKey": created_subfolders[i]["sampleImageKey"]
+                    "subFolderId": created_subfolders[idx]["subFolderId"],
+                    "sampleImage": created_subfolders[idx]["sampleImage"],
+                    "sampleImageKey": created_subfolders[idx]["sampleImageKey"]
                 }
-                for i, p in enumerate(persons)
+                for idx, p in enumerate(persons)
             ]
         }
 
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
-
+        raise HTTPException(status_code=500, detail=str(e))
 
 # Serve index.html at root
 @app.get("/", response_class=HTMLResponse)
