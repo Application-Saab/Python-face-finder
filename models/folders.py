@@ -8,7 +8,8 @@ from mongoengine import (
     DateTimeField,
     IntField,
     FloatField,
-    ObjectIdField
+    ObjectIdField,
+    BooleanField
 )
 from datetime import datetime
 import bson
@@ -18,9 +19,9 @@ import bson
 # Embedded: FolderDp
 # ---------------------------
 class FolderDp(EmbeddedDocument):
-    fileUrl = StringField(required=True)
+    fileUrl = StringField()
 
-    thumbnailUrl = StringField(required=True)
+    thumbnailUrl = StringField()
 
     s3Key = StringField()
 
@@ -49,10 +50,12 @@ class SubFolder(EmbeddedDocument):
     )
 
 
-    personCount = IntField(default=0)
-
     folderDp = EmbeddedDocumentField(
         FolderDp
+    )
+
+    isLocker = BooleanField(
+        default=False
     )
 
     createdAt = DateTimeField(
@@ -130,8 +133,8 @@ class Folder(Document):
 
     orderId = StringField()
 
-    subFolders = ListField(
-        EmbeddedDocumentField(SubFolder),
+    subFolders = EmbeddedDocumentListField(
+        SubFolder,
         default=list
     )
 
