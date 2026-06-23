@@ -371,159 +371,6 @@ async def search_faces_s3(
         media_type="text/event-stream",
     )
 
-def cosine_sim(a, b):
-    return float(np.dot(a, b) / (norm(a) * norm(b) + 1e-8))
-
-
-# -----------------------------
-# MAIN PROCESS FUNCTION
-# -----------------------------
-def process_face_count(folder_name: str):
-    print(f"STARTING FACE PROCESSING: {folder_name}")
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    try:
-        image_keys = list_s3_images(folder_name)
-
-        if not image_keys:
-            print("No images found")
-            return
-
-        print(f"Total Images: {len(image_keys)}")
-
-        persons = []
-        total_faces_detected = 0
-
-        BATCH_SIZE = 10
-        THRESHOLD = 0.58   # improved stable value
-
-        batches = [
-            image_keys[i:i + BATCH_SIZE]
-            for i in range(0, len(image_keys), BATCH_SIZE)
-        ]
-
-        for batch_no, keys in enumerate(batches, start=1):
-
-            print(f"\nProcessing Batch {batch_no}/{len(batches)}")
-
-            imgs = loop.run_until_complete(
-                asyncio.gather(
-                    *[read_s3_image_async(k, loop) for k in keys]
-                )
-            )
-
-            for img in imgs:
-                if img is None:
-                    continue
-
-                faces = searcher.app.get(img)
-
-                print(f"Detected faces: {len(faces)}")
-
-                for face in faces:
-
-                    # -------------------------
-                    # FILTER BAD DETECTIONS
-                    # -------------------------
-                    if face.embedding is None:
-                        continue
-
-                    if getattr(face, "det_score", 1.0) < 0.75:
-                        continue
-
-                    bbox = face.bbox
-                    w = bbox[2] - bbox[0]
-                    h = bbox[3] - bbox[1]
-
-                    if w < 40 or h < 40:
-                        continue
-
-                    emb = face.normed_embedding.astype(np.float32)
-                    total_faces_detected += 1
-
-                    # -------------------------
-                    # FIND BEST MATCH
-                    # -------------------------
-                    best_sim = -1
-                    best_idx = -1
-
-                    for i, p in enumerate(persons):
-                        sim = cosine_sim(emb, p["embedding"])
-
-                        if sim > best_sim:
-                            best_sim = sim
-                            best_idx = i
-
-                    # -------------------------
-                    # DECISION
-                    # -------------------------
-                    if best_idx != -1 and best_sim >= THRESHOLD:
-
-                        p = persons[best_idx]
-
-                        # table centroid update + normalization
-                        new_emb = (
-                            (p["embedding"] * p["count"]) + emb
-                        ) / (p["count"] + 1)
-
-                        p["embedding"] = new_emb / (norm(new_emb) + 1e-8)
-                        p["count"] += 1
-
-                    else:
-                        persons.append({
-                            "embedding": emb.copy(),
-                            "count": 1
-                        })
-
-        print("\n================")
-        print("TOTAL FACES:", total_faces_detected)
-        print("UNIQUE PERSONS:", len(persons))
-        print("================")
-
-        # -------------------------
-        # SAVE TO DB
-        # -------------------------
-        folder_doc = Folder.objects(folderName=folder_name).first()
-
-        print("DB SAVE START")
-        if folder_doc:
-            folder_doc.totalPersonCount = len(persons)
-            folder_doc.totalFacesDetected = total_faces_detected
-            folder_doc.updatedAt = datetime.utcnow()
-            folder_doc.save()
-
-        return {
-            "success": True,
-            "totalFaces": total_faces_detected,
-            "uniquePersons": len(persons)
-        }
-
-    finally:
-        loop.close()
-
-
-# -----------------------------
-# FASTAPI ENDPOINT
-# -----------------------------
-@app.post("/count-unique-persons")
-async def count_unique_persons(
-    background_tasks: BackgroundTasks,
-    folder_name: str = Form(...)
-):
-    try:
-        background_tasks.add_task(process_face_count, folder_name)
-
-        return {
-            "success": True,
-            "message": "Face processing started in background"
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# DBSCAN Config (Senior ke parameters)
 EPS = 0.6
 MIN_SAMPLES = 2
 
@@ -561,10 +408,9 @@ async def count_unique_persons(
         if not image_keys:
             return {"success": False, "message": "No images found"}
         
-
         print(f"Total Images Found = {len(image_keys)}")
 
-        # Arrays to collect face data for DBSCAN (Senior's Approach)
+        # Arrays to collect face data for DBSCAN
         all_embeddings = []
         face_metadata = []  # To store references of key, face_crop, and det_score
 
@@ -591,7 +437,7 @@ async def count_unique_persons(
                 if not faces:
                     continue
 
-                # Senior's Logic: Agar image me multiple faces hain, toh sabse bada face lo
+                # Senior's Logic: Multi-face me se sabse bada face uthana
                 if len(faces) > 1:
                     face = max(
                         faces,
@@ -629,36 +475,42 @@ async def count_unique_persons(
             raise HTTPException(status_code=400, detail="No faces detected in the given images.")
 
         # =========================================================
-        # STAGE 2: DBSCAN CLUSTERING (Senior's Core Logic)
+        # STAGE 2: DBSCAN CLUSTERING
         # =========================================================
         np_embeddings = np.array(all_embeddings)
         clustering = DBSCAN(eps=EPS, min_samples=MIN_SAMPLES, metric="cosine")
         labels = clustering.fit_predict(np_embeddings)
 
-        # Map DBSCAN results back to groups
-        # Format: { label_id: { "images": [...], "best_crop": crop, "max_score": float } }
+        # Format: { cluster_or_noise_id: { "images": [...], "best_crop": crop, "max_score": float } }
         cluster_groups = {}
-        unknown_images = []
+        unknown_faces_count = 0
+        
+        # Ek counter single-photo/noise individuals ko unique group IDs dene ke liye
+        noise_id_counter = -2 
 
         for label, metadata in zip(labels, face_metadata):
+            # FIXED LOGIC: Agar label -1 (Noise) hai, toh usko discard nahi karenge.
+            # Use ek alag unique negative ID de denge taaki uska apna ek alag personal folder bane.
             if label == -1:
-                # -1 means Outlier/Unknown face in DBSCAN
-                unknown_images.append(metadata["key"])
-                continue
+                current_group_id = noise_id_counter
+                noise_id_counter -= 1
+                unknown_faces_count += 1
+            else:
+                current_group_id = label
 
-            if label not in cluster_groups:
-                cluster_groups[label] = {
+            if current_group_id not in cluster_groups:
+                cluster_groups[current_group_id] = {
                     "images": [],
                     "best_crop": metadata["face_crop"],
                     "max_score": metadata["det_score"]
                 }
             
-            cluster_groups[label]["images"].append(metadata["key"])
+            cluster_groups[current_group_id]["images"].append(metadata["key"])
             
-            # Agar kisi face ki quality/score better hai toh usko Profile Pic (DP) banayenge
-            if metadata["det_score"] > cluster_groups[label]["max_score"]:
-                cluster_groups[label]["best_crop"] = metadata["face_crop"]
-                cluster_groups[label]["max_score"] = metadata["det_score"]
+            # Profile photo update based on max detection score
+            if metadata["det_score"] > cluster_groups[current_group_id]["max_score"]:
+                cluster_groups[current_group_id]["best_crop"] = metadata["face_crop"]
+                cluster_groups[current_group_id]["max_score"] = metadata["det_score"]
 
         # =========================================================
         # STAGE 3: DB PERSISTENCE & S3 UPLOAD
@@ -670,14 +522,21 @@ async def count_unique_persons(
         created_subfolders = []
         persons_response_data = []
 
-        for index, (label, group_data) in enumerate(cluster_groups.items()):
+        # Counter for proper naming (e.g., Person 1, Person 2...)
+        person_display_index = 1
+
+        for group_id, group_data in cluster_groups.items():
             person_id = str(uuid.uuid4())
             
-            # Uploading the best available face crop as Folder Thumbnail
+            # Uploading the best available face crop as Folder Thumbnail to S3
             crop_key, crop_url = upload_face_crop(group_data["best_crop"], folderId, person_id)
 
+            # Naming convention handler
+            display_name = f"Person {person_display_index}"
+            person_display_index += 1
+
             subfolder = SubFolder(
-                folderName=f"Person {index + 1}",
+                folderName=display_name,
                 type="others",
                 userId=userId,
                 personId=person_id,
@@ -694,7 +553,7 @@ async def count_unique_persons(
             created_subfolders.append({
                 "subFolderId": str(subfolder._id),
                 "personId": person_id,
-                "images": group_data["images"],  # Kept for the tagging phase below
+                "images": group_data["images"],  # Used in Stage 4 below
                 "sampleImage": crop_url,
                 "sampleImageKey": crop_key
             })
@@ -707,12 +566,13 @@ async def count_unique_persons(
                 "sampleImageKey": crop_key
             })
 
+        # Total unique individuals (Valid Clusters + All Noise Single Photos)
         folder_doc.uniqueFaceCount = len(cluster_groups)
         folder_doc.save()
         print("✅ Folder Database Setup Success")
 
         # =====================================================
-        # STAGE 4: IMAGE TAGGING PROCESS
+        # STAGE 4: IMAGE TAGGING PROCESS (Aapka original tagging flow)
         # =====================================================
         print("\n🚀 STARTING IMAGE TAGGING PROCESS")
         for sub_info in created_subfolders:
@@ -736,13 +596,12 @@ async def count_unique_persons(
             "totalFaceDetections": len(all_embeddings),
             "uniquePersons": len(cluster_groups),
             "subFoldersCreated": len(created_subfolders),
-            "unknownFacesCount": len(unknown_images),
+            "unknownFacesCount": unknown_faces_count,
             "groups": persons_response_data
         }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 
 
