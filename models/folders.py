@@ -19,6 +19,7 @@ import bson
 # Embedded: FolderDp
 # ---------------------------
 class FolderDp(EmbeddedDocument):
+    meta = {"strict": False}
     fileUrl = StringField()
 
     thumbnailUrl = StringField()
@@ -32,6 +33,8 @@ class FolderDp(EmbeddedDocument):
 # Embedded: SubFolder
 # ---------------------------
 class SubFolder(EmbeddedDocument):
+
+    meta = {"strict": False}
     _id = StringField(
         default=lambda: str(bson.ObjectId())
     )
@@ -67,6 +70,7 @@ class SubFolder(EmbeddedDocument):
 # Embedded: DeviceTracking
 # ---------------------------
 class DeviceTracking(EmbeddedDocument):
+    meta = {"strict": False}
     _id = ObjectIdField()
 
     userId = StringField()
@@ -86,6 +90,7 @@ class DeviceTracking(EmbeddedDocument):
 class Folder(Document):
     meta = {
         "collection": "folders",
+        "strict": False,
         "indexes": [
             "viewedBy",
             "customerId",

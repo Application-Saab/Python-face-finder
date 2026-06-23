@@ -12,6 +12,7 @@ import bson
 class WebLinks(Document):
     meta = {
     "collection": "weblinks",
+    "strict": False,
     "auto_create_index": False,
     "indexes": [
         "mainFolderId",
