@@ -523,25 +523,20 @@ async def count_unique_persons(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-
-
-
-
-
+# DBSCAN Config (Senior ke parameters)
+EPS = 0.6
+MIN_SAMPLES = 2
 
 def upload_face_crop(face_crop, folder_id, person_id):
     buffer = io.BytesIO()
-
     Image.fromarray(face_crop).save(
         buffer,
         format="WEBP",
         quality=90
     )
-
     buffer.seek(0)
 
     crop_key = f"face-groups/{folder_id}/{person_id}.webp"
-
     s3.upload_fileobj(
         buffer,
         S3_BUCKET,
@@ -549,46 +544,9 @@ def upload_face_crop(face_crop, folder_id, person_id):
         ExtraArgs={"ContentType": "image/webp"}
     )
 
-    crop_url = (
-        f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{crop_key}"
-    )
-
+    crop_url = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{crop_key}"
     return crop_key, crop_url
 
-
-
-
-
-def cosine(a, b):
-    a = np.array(a)
-    b = np.array(b)
-
-    denom = (norm(a) * norm(b))
-    if denom == 0:
-        return 0.0
-
-    return float(np.dot(a, b) / denom)
-
-
-def is_image_blurry(face_img, threshold=65.0):
-    """
-    Strict Laplacian Variance Check.
-    Higher threshold (65.0) ensures only sharp, high-quality front faces pass.
-    """
-    try:
-        if face_img is None or face_img.size == 0:
-            return True
-        if len(face_img.shape) == 3:
-            gray = cv2.cvtColor(face_img, cv2.COLOR_RGB2GRAY)
-        else:
-            gray = face_img
-            
-        variance = cv2.Laplacian(gray, cv2.CV_64F).var()
-        print(f"🔍 Quality Check -> Sharpness Variance: {variance:.2f}")
-        return variance < threshold
-    except Exception as e:
-        print(f"Error checking blur: {e}")
-        return False
 
 @app.post("/count-unique-persons4")
 async def count_unique_persons(
@@ -597,27 +555,28 @@ async def count_unique_persons(
     userId: str = Form(...)
 ):
     try:
-        def get_s3_url(key):
-            if not key:
-                return None
-            return f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{key}"
-
         loop = asyncio.get_running_loop()
         image_keys = list_s3_images(folder_name)
 
         if not image_keys:
             return {"success": False, "message": "No images found"}
+        
 
-        persons = []
+        print(f"Total Images Found = {len(image_keys)}")
+
+        # Arrays to collect face data for DBSCAN (Senior's Approach)
+        all_embeddings = []
+        face_metadata = []  # To store references of key, face_crop, and det_score
+
         BATCH_SIZE = 10
-
         batches = [
             image_keys[i:i + BATCH_SIZE]
             for i in range(0, len(image_keys), BATCH_SIZE)
         ]
 
-        total_faces = 0
-
+        # =========================================================
+        # STAGE 1: EXTRACT EMBEDDINGS FROM ALL IMAGES
+        # =========================================================
         for keys in batches:
             imgs = await asyncio.gather(*[
                 read_s3_image_async(k, loop)
@@ -632,144 +591,133 @@ async def count_unique_persons(
                 if not faces:
                     continue
 
-                for face in faces:
-                    # =========================================================
-                    # RULE 1: STRICT PURE FRONT FACE FILTER (LANDMARKS RATIO)
-                    # =========================================================
-                    if hasattr(face, 'kps') and face.kps is not None:
-                        kps = face.kps
-                        left_eye_x = kps[0][0]
-                        right_eye_x = kps[1][0]
-                        nose_x = kps[2][0]
-                        
-                        eye_distance = abs(right_eye_x - left_eye_x)
-                        
-                        if eye_distance > 0:
-                            ratio = abs(nose_x - left_eye_x) / eye_distance
-                            # Perfect front face ka ratio exactly 0.5 ke paas hota hai.
-                            # Strict Range (0.32 to 0.68) - Iske bahar ka koi bhi side angle skip ho jayega.
-                            if ratio < 0.32 or ratio > 0.68:
-                                print(f"🚫 Dropped Side Profile Face (Ratio: {ratio:.2f}) in image: {key}")
-                                continue
-                        else:
-                            # Agar dono aankhein sahi se visible nahi hain toh drop karo
-                            continue
+                # Senior's Logic: Agar image me multiple faces hain, toh sabse bada face lo
+                if len(faces) > 1:
+                    face = max(
+                        faces,
+                        key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1])
+                    )
+                else:
+                    face = faces[0]
 
-                    # =========================================================
-                    # RULE 2: HIGH CONFIDENCE FILTER
-                    # =========================================================
-                    det_score = getattr(face, 'det_score', 1.0)
-                    if det_score < 0.75:  # Only allow highly confident, clear detections
-                        print(f"🚫 Dropped Low Confidence Face (Score: {det_score:.2f})")
-                        continue
+                # Low confidence filter strictly kept to avoid pure noise/non-faces
+                det_score = getattr(face, 'det_score', 1.0)
+                if det_score < 0.70:  
+                    continue
 
-                    # Setup for Matching
-                    emb = face.embedding
-                    matched_person = None
-                    max_sim = -1
+                # Crop generation for folder display icon
+                x1, y1, x2, y2 = map(int, face.bbox)
+                face_w, face_h = x2 - x1, y2 - y1
+                pad_x, pad_y = int(face_w * 0.20), int(face_h * 0.20)
+                h, w = img.shape[:2]
+                
+                crop_x1 = max(0, x1 - pad_x)
+                crop_y1 = max(0, y1 - pad_y)
+                crop_x2 = min(w, x2 + pad_x)
+                crop_y2 = min(h, y2 + pad_y)
+                face_crop = img[crop_y1:crop_y2, crop_x1:crop_x2]
 
-                    for person in persons:
-                        for saved_emb in person["embeddings_list"]:
-                            sim = cosine(emb, saved_emb)
-                            if sim > max_sim:
-                                max_sim = sim
-                                if sim >= 0.45:  # Confirmed match threshold
-                                    matched_person = person
+                # Collect for DBSCAN clustering
+                all_embeddings.append(face.embedding)
+                face_metadata.append({
+                    "key": key,
+                    "face_crop": face_crop.copy() if face_crop.size > 0 else img[y1:y2, x1:x2],
+                    "det_score": det_score
+                })
 
-                    # Crop Face for Quality/Blur verification
-                    x1, y1, x2, y2 = map(int, face.bbox)
-                    face_w, face_h = x2 - x1, y2 - y1
-                    pad_x, pad_y = int(face_w * 0.20), int(face_h * 0.20)
-                    h, w = img.shape[:2]
-                    
-                    crop_x1 = max(0, x1 - pad_x)
-                    crop_y1 = max(0, y1 - pad_y)
-                    crop_x2 = min(w, x2 + pad_x)
-                    crop_y2 = min(h, y2 + pad_y)
-                    face_crop = img[crop_y1:crop_y2, crop_x1:crop_x2]
+        if not all_embeddings:
+            raise HTTPException(status_code=400, detail="No faces detected in the given images.")
 
-                    # IF MATCH FOUND: Add to existing person group
-                    if matched_person:
-                        matched_person["count"] += 1
-                        matched_person["images"].append(key)
-                        
-                        # Only feed clean, super sharp front angles into anchor list
-                        if det_score > 0.80 and len(matched_person["embeddings_list"]) < 5:
-                            if not is_image_blurry(face_crop, threshold=60.0):
-                                matched_person["embeddings_list"].append(emb.copy())
+        # =========================================================
+        # STAGE 2: DBSCAN CLUSTERING (Senior's Core Logic)
+        # =========================================================
+        np_embeddings = np.array(all_embeddings)
+        clustering = DBSCAN(eps=EPS, min_samples=MIN_SAMPLES, metric="cosine")
+        labels = clustering.fit_predict(np_embeddings)
 
-                    # IF NO MATCH FOUND: Try creating a new clean folder
-                    else:
-                        # =========================================================
-                        # RULE 3: STRICT BLUR CHECK ON NEW FOLDER CREATION
-                        # =========================================================
-                        if is_image_blurry(face_crop, threshold=65.0):
-                            print(f"🚫 Dropped Folder Creation: Face is Blurry/Low-res in image: {key}")
-                            continue
+        # Map DBSCAN results back to groups
+        # Format: { label_id: { "images": [...], "best_crop": crop, "max_score": float } }
+        cluster_groups = {}
+        unknown_images = []
 
-                        # Strict entry filter for new identities
-                        if det_score < 0.78:
-                            print(f"⚠️ Skipped cluster generation for weak face metrics ({det_score:.2f})")
-                            continue
+        for label, metadata in zip(labels, face_metadata):
+            if label == -1:
+                # -1 means Outlier/Unknown face in DBSCAN
+                unknown_images.append(metadata["key"])
+                continue
 
-                        total_faces += 1
-                        person_id = str(uuid.uuid4())
-                        print(f"📸 [NEW FOLDER] Creating Clear Front Group - Score={det_score:.2f} Image={key}")
+            if label not in cluster_groups:
+                cluster_groups[label] = {
+                    "images": [],
+                    "best_crop": metadata["face_crop"],
+                    "max_score": metadata["det_score"]
+                }
+            
+            cluster_groups[label]["images"].append(metadata["key"])
+            
+            # Agar kisi face ki quality/score better hai toh usko Profile Pic (DP) banayenge
+            if metadata["det_score"] > cluster_groups[label]["max_score"]:
+                cluster_groups[label]["best_crop"] = metadata["face_crop"]
+                cluster_groups[label]["max_score"] = metadata["det_score"]
 
-                        crop_key, crop_url = upload_face_crop(face_crop, folderId, person_id)
-
-                        persons.append({
-                           "person_id": person_id,
-                           "embeddings_list": [emb.copy()],
-                           "count": 1,
-                           "images": [key],
-                           "faceKey": crop_key,
-                           "faceUrl": crop_url
-                        })
-
-        print("All folders count =", Folder.objects.count())
+        # =========================================================
+        # STAGE 3: DB PERSISTENCE & S3 UPLOAD
+        # =========================================================
         folder_doc = Folder.objects(id=folderId).first()
-
         if not folder_doc:
             raise HTTPException(status_code=404, detail="Folder not found")
 
         created_subfolders = []
+        persons_response_data = []
 
-        for index, person in enumerate(persons):
-            sample_image_key = person["images"][0] if person["images"] else None
+        for index, (label, group_data) in enumerate(cluster_groups.items()):
+            person_id = str(uuid.uuid4())
+            
+            # Uploading the best available face crop as Folder Thumbnail
+            crop_key, crop_url = upload_face_crop(group_data["best_crop"], folderId, person_id)
+
             subfolder = SubFolder(
                 folderName=f"Person {index + 1}",
                 type="others",
                 userId=userId,
-                personId=person["person_id"],
-                personCount=person["count"],
+                personId=person_id,
+                personCount=len(group_data["images"]),
                 folderDp={
-                    "fileUrl": person["faceUrl"],
-                    "thumbnailUrl": person["faceUrl"],
-                    "s3Key": person["faceKey"],
-                    "thumbnailKey": person["faceKey"]
-                } if sample_image_key else None
+                    "fileUrl": crop_url,
+                    "thumbnailUrl": crop_url,
+                    "s3Key": crop_key,
+                    "thumbnailKey": crop_key
+                }
             )
             folder_doc.subFolders.append(subfolder)
 
             created_subfolders.append({
                 "subFolderId": str(subfolder._id),
-                "personId": person["person_id"],
-                "sampleImage": person["faceUrl"],
-                "sampleImageKey": person["faceKey"]
+                "personId": person_id,
+                "images": group_data["images"],  # Kept for the tagging phase below
+                "sampleImage": crop_url,
+                "sampleImageKey": crop_key
             })
 
-        folder_doc.uniqueFaceCount = len(persons)
+            persons_response_data.append({
+                "person_id": person_id,
+                "count": len(group_data["images"]),
+                "subFolderId": str(subfolder._id),
+                "sampleImage": crop_url,
+                "sampleImageKey": crop_key
+            })
+
+        folder_doc.uniqueFaceCount = len(cluster_groups)
         folder_doc.save()
         print("✅ Folder Database Setup Success")
 
         # =====================================================
-        # TAG ALL PERSON IMAGES WITH THEIR CREATED SUBFOLDER ID
+        # STAGE 4: IMAGE TAGGING PROCESS
         # =====================================================
         print("\n🚀 STARTING IMAGE TAGGING PROCESS")
-        for i, person in enumerate(persons):
-            sub_folder_id = created_subfolders[i]["subFolderId"]
-            for image_key in person["images"]:
+        for sub_info in created_subfolders:
+            sub_folder_id = sub_info["subFolderId"]
+            for image_key in sub_info["images"]:
                 try:
                     filename = image_key.split("/")[-1]
                     docs = WebLinks.objects(thumbnailKey__icontains=filename)
@@ -785,23 +733,18 @@ async def count_unique_persons(
         return {
             "success": True,
             "totalPhotos": len(image_keys),
-            "totalFaceDetections": total_faces,
-            "uniquePersons": len(persons),
+            "totalFaceDetections": len(all_embeddings),
+            "uniquePersons": len(cluster_groups),
             "subFoldersCreated": len(created_subfolders),
-            "groups": [
-                {
-                    "person_id": p["person_id"],
-                    "count": p["count"],
-                    "subFolderId": created_subfolders[idx]["subFolderId"],
-                    "sampleImage": created_subfolders[idx]["sampleImage"],
-                    "sampleImageKey": created_subfolders[idx]["sampleImageKey"]
-                }
-                for idx, p in enumerate(persons)
-            ]
+            "unknownFacesCount": len(unknown_images),
+            "groups": persons_response_data
         }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+
 
 # Serve index.html at root
 @app.get("/", response_class=HTMLResponse)
