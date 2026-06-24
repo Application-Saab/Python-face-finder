@@ -502,7 +502,7 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
             person_id = str(uuid.uuid4())
             crop_key, crop_url = upload_face_crop(group_data["best_crop"], folderId, person_id)
 
-            display_name = f"Person {len(folder_doc.subFolders) + 1}"
+            display_name = f"Person"
 
             subfolder = SubFolder(
                 folderName=display_name,
