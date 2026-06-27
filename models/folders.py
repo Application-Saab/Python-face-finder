@@ -43,6 +43,10 @@ class SubFolder(EmbeddedDocument):
         required=True
     )
 
+    personCount = IntField(default=0)
+
+    isPersonFolder = BooleanField(default=False)
+
     type = StringField(
         required=True,
         choices=["my_photos", "others"]

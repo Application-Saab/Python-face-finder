@@ -32,6 +32,7 @@ from fastapi import BackgroundTasks
 from database import connect_db
 from dotenv import load_dotenv
 load_dotenv()
+from fastapi import BackgroundTasks
 
 from eventFaceFinder import router as event_router
 
@@ -371,182 +372,213 @@ async def search_faces_s3(
         media_type="text/event-stream",
     )
 
-def cosine_sim(a, b):
-    return float(np.dot(a, b) / (norm(a) * norm(b) + 1e-8))
+
+EPS = 0.6
+MIN_SAMPLES = 2
+
+def upload_face_crop(face_crop, folder_id, person_id):
+    buffer = io.BytesIO()
+    Image.fromarray(face_crop).save(
+        buffer,
+        format="WEBP",
+        quality=90
+    )
+    buffer.seek(0)
+
+    crop_key = f"face-groups/{folder_id}/{person_id}.webp"
+    s3.upload_fileobj(
+        buffer,
+        S3_BUCKET,
+        crop_key,
+        ExtraArgs={"ContentType": "image/webp"}
+    )
+
+    crop_url = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{crop_key}"
+    return crop_key, crop_url
 
 
-# -----------------------------
-# MAIN PROCESS FUNCTION
-# -----------------------------
-def process_face_count(folder_name: str):
-    print(f"STARTED PROCESSING -----------")
-    print(f"FOLDER NAME = {folder_name}")
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
+def process_face_clustering_in_background(image_keys, folderId, userId, folder_name):
     try:
-        print(f"[{folder_name}] Fetching images from S3...")
-        image_keys = list_s3_images(folder_name)
-
-        if not image_keys:
-            print(f"[{folder_name}] No images found")
-            return
-
-        print(f"[{folder_name}] Total Images Found = {len(image_keys)}")
-
-        persons = []
-        total_faces_detected = 0
+        print(f"Total Images Found = {len(image_keys)}")
+        all_embeddings = []
+        face_metadata = []
 
         BATCH_SIZE = 10
-        THRESHOLD = 0.58   # improved stable value
-
         batches = [
             image_keys[i:i + BATCH_SIZE]
             for i in range(0, len(image_keys), BATCH_SIZE)
         ]
 
-        for batch_no, keys in enumerate(batches, start=1):
+        # =========================================================
+        # STAGE 1: EXTRACT EMBEDDINGS FROM ALL IMAGES
+        # =========================================================
+        for keys in batches:
+            imgs = [read_s3_image(k) for k in keys]
 
-            print(f"\nProcessing Batch {batch_no}/{len(batches)}")
-
-            imgs = loop.run_until_complete(
-                asyncio.gather(
-                    *[read_s3_image_async(k, loop) for k in keys]
-                )
-            )
-            print(
-                f"[{folder_name}] Batch {batch_no} "
-                f"Downloaded {len(imgs)} images"
-            )
-
-            for img in imgs:
+            for img, key in zip(imgs, keys):
                 if img is None:
                     continue
-                
-                print(f"[{folder_name}] Running face detection...")
+
                 faces = searcher.app.get(img)
-                print(f"[{folder_name}] Face detection completed")
+                if not faces:
+                    continue
 
-                print(f"Detected faces: {len(faces)}")
+                if len(faces) > 1:
+                    face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+                else:
+                    face = faces[0]
 
-                for face in faces:
+                det_score = getattr(face, 'det_score', 1.0)
+                if det_score < 0.70:  
+                    continue
 
-                    # -------------------------
-                    # FILTER BAD DETECTIONS
-                    # -------------------------
-                    if face.embedding is None:
-                        continue
+                x1, y1, x2, y2 = map(int, face.bbox)
+                face_w, face_h = x2 - x1, y2 - y1
+                pad_x, pad_y = int(face_w * 0.20), int(face_h * 0.20)
+                h, w = img.shape[:2]
+                
+                crop_x1 = max(0, x1 - pad_x)
+                crop_y1 = max(0, y1 - pad_y)
+                crop_x2 = min(w, x2 + pad_x)
+                crop_y2 = min(h, y2 + pad_y)
+                face_crop = img[crop_y1:crop_y2, crop_x1:crop_x2]
 
-                    if getattr(face, "det_score", 1.0) < 0.75:
-                        continue
+                all_embeddings.append(face.embedding)
+                face_metadata.append({
+                    "key": key,
+                    "face_crop": face_crop.copy() if face_crop.size > 0 else img[y1:y2, x1:x2],
+                    "det_score": det_score
+                })
 
-                    bbox = face.bbox
-                    w = bbox[2] - bbox[0]
-                    h = bbox[3] - bbox[1]
+        if not all_embeddings:
+            print("⚠️ No faces detected in the given images.")
+            return
 
-                    if w < 40 or h < 40:
-                        continue
+        # =========================================================
+        # STAGE 2: DBSCAN CLUSTERING
+        # =========================================================
+        np_embeddings = np.array(all_embeddings)
+        clustering = DBSCAN(eps=EPS, min_samples=MIN_SAMPLES, metric="cosine")
+        labels = clustering.fit_predict(np_embeddings)
 
-                    emb = face.normed_embedding.astype(np.float32)
-                    total_faces_detected += 1
+        cluster_groups = {}
+        unknown_faces_count = 0
+        noise_id_counter = -2 
 
-                    # -------------------------
-                    # FIND BEST MATCH
-                    # -------------------------
-                    best_sim = -1
-                    best_idx = -1
+        for label, metadata in zip(labels, face_metadata):
+            if label == -1:
+                current_group_id = noise_id_counter
+                noise_id_counter -= 1
+                unknown_faces_count += 1
+            else:
+                current_group_id = label
 
-                    for i, p in enumerate(persons):
-                        sim = cosine_sim(emb, p["embedding"])
+            if current_group_id not in cluster_groups:
+                cluster_groups[current_group_id] = {
+                    "images": [],
+                    "best_crop": metadata["face_crop"],
+                    "max_score": metadata["det_score"]
+                }
+            
+            cluster_groups[current_group_id]["images"].append(metadata["key"])
+            if metadata["det_score"] > cluster_groups[current_group_id]["max_score"]:
+                cluster_groups[current_group_id]["best_crop"] = metadata["face_crop"]
+                cluster_groups[current_group_id]["max_score"] = metadata["det_score"]
 
-                        if sim > best_sim:
-                            best_sim = sim
-                            best_idx = i
+        # =========================================================
+        # STAGE 3: DB PERSISTENCE & S3 UPLOAD
+        # =========================================================
+        folder_doc = Folder.objects(id=folderId).first()
+        if not folder_doc:
+            print("❌ Folder not found in background task")
+            return
+        
+        current_ai_person_count = folder_doc.totalPersonCount or 0
+        
+        new_ai_persons_detected = len(cluster_groups)
 
-                    # -------------------------
-                    # DECISION
-                    # -------------------------
-                    if best_idx != -1 and best_sim >= THRESHOLD:
+        created_subfolders = []
+        for group_id, group_data in cluster_groups.items():
+            person_id = str(uuid.uuid4())
+            crop_key, crop_url = upload_face_crop(group_data["best_crop"], folderId, person_id)
 
-                        p = persons[best_idx]
+            display_name = f"Person"
 
-                        # table centroid update + normalization
-                        new_emb = (
-                            (p["embedding"] * p["count"]) + emb
-                        ) / (p["count"] + 1)
-
-                        p["embedding"] = new_emb / (norm(new_emb) + 1e-8)
-                        p["count"] += 1
-
-                    else:
-                        persons.append({
-                            "embedding": emb.copy(),
-                            "count": 1
-                        })
-
-        print("\n================")
-        print("TOTAL FACES:", total_faces_detected)
-        print("UNIQUE PERSONS:", len(persons))
-        print("================")
-
-        print(
-            f"[{folder_name}] "
-            f"Updating MongoDB..."
-        )
-
-        # -------------------------
-        # SAVE TO DB
-        # -------------------------
-        folder_doc = Folder.objects(folderName=folder_name).first()
-
-        if folder_doc:
-            folder_doc.totalPersonCount = len(persons)
-            folder_doc.totalFacesDetected = total_faces_detected
-            folder_doc.updatedAt = datetime.utcnow()
-            print(f"[{folder_name}] Before Mongo Save")
-            folder_doc.save()
-            print(f"[{folder_name}] After Mongo Save")
-
-            print(
-                f"[{folder_name}] "
-                f"MongoDB Updated Successfully"
+            subfolder = SubFolder(
+                folderName=display_name,
+                type="others",
+                userId=userId,
+                personCount=len(group_data["images"]),
+                isPersonFolder=True,
+                folderDp={
+                    "fileUrl": crop_url,
+                    "thumbnailUrl": crop_url,
+                    "s3Key": crop_key,
+                    "thumbnailKey": crop_key
+                }
             )
+            folder_doc.subFolders.append(subfolder)
 
-        return {
-            "success": True,
-            "totalFaces": total_faces_detected,
-            "uniquePersons": len(persons)
-        }
+            created_subfolders.append({
+                "subFolderId": str(subfolder._id),
+                "images": group_data["images"]
+            })
 
-    finally:
-        loop.close()
+        folder_doc.totalPersonCount = current_ai_person_count + new_ai_persons_detected
+
+        folder_doc.uniqueFaceCount = len(cluster_groups)
+        folder_doc.save()
+        print("✅ Folder Database Setup Success")
+
+        # =====================================================
+        # STAGE 4: IMAGE TAGGING PROCESS
+        # =====================================================
+        print("\n🚀 STARTING IMAGE TAGGING PROCESS")
+        for sub_info in created_subfolders:
+            sub_folder_id = sub_info["subFolderId"]
+            for image_key in sub_info["images"]:
+                try:
+                    filename = image_key.split("/")[-1]
+                    WebLinks.objects(thumbnailKey__endswith=filename).update(
+                        add_to_set__folderIds=sub_folder_id
+                    )
+                except Exception as e:
+                    print(f"❌ Failed Tagging {image_key}: {str(e)}")
+        print("\n✅ IMAGE TAGGING COMPLETED")
+
+    except Exception as e:
+        print(f"❌ Error in background face recognition: {str(e)}")
 
 
-# -----------------------------
-# FASTAPI ENDPOINT
-# -----------------------------
 @app.post("/count-unique-persons")
 async def count_unique_persons(
     background_tasks: BackgroundTasks,
-    folder_name: str = Form(...)
+    folder_name: str = Form(...),
+    folderId: str = Form(...),
+    userId: str = Form(...)
 ):
     try:
-        print("API HIT")
-        print(f"FOLDER NAME = {folder_name}")
-        background_tasks.add_task(process_face_count, folder_name)
+        image_keys = list_s3_images(folder_name)
+
+        if not image_keys:
+            return {"success": False, "message": "No images found in S3 bucket"}
+        
+        background_tasks.add_task(
+            process_face_clustering_in_background, 
+            image_keys, 
+            folderId, 
+            userId, 
+            folder_name
+        )
 
         return {
             "success": True,
-            "message": "Face processing started in background"
+            "message": "Face recognition and clustering started in background.",
+            "totalPhotosFound": len(image_keys)
         }
 
     except Exception as e:
-        print("[API ERROR]")
-        print(f"FOLDER NAME = {folder_name}")
-        print(str(e))
-        
         raise HTTPException(status_code=500, detail=str(e))
-
 
 # Serve index.html at root
 @app.get("/", response_class=HTMLResponse)
