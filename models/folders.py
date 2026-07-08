@@ -9,7 +9,8 @@ from mongoengine import (
     IntField,
     FloatField,
     ObjectIdField,
-    BooleanField
+    BooleanField,
+    DynamicField,
 )
 from datetime import datetime
 import bson
@@ -123,10 +124,7 @@ class Folder(Document):
         required=True
     )
 
-    viewedBy = ListField(
-        StringField(),
-        default=list
-    )
+    viewedBy = DynamicField()
 
     clickCount = IntField(
         default=0
