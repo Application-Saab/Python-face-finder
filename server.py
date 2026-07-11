@@ -396,7 +396,6 @@ def upload_face_crop(face_crop, folder_id, person_id):
     crop_url = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{crop_key}"
     return crop_key, crop_url
 
-
 def process_face_clustering_in_background(image_keys, folderId, userId, folder_name):
     try:
         print(f"Total Images Found hello = {len(image_keys)}")
@@ -423,19 +422,19 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                 if not faces:
                     continue
 
-
                 for face in faces:
                     det_score = getattr(face, 'det_score', 1.0)
-                    if det_score < 0.65: 
+                    if det_score < 0.65:  
                         continue
 
                     x1, y1, x2, y2 = map(int, face.bbox)
                     face_w, face_h = x2 - x1, y2 - y1
                     
-                    if face_w < 35 or face_h < 35:
+                    if face_w < 45 or face_h < 45:
                         continue
 
-                    pad_x, pad_y = int(face_w * 0.20), int(face_h * 0.20)
+                    # Padding kam ki taaki jhuke hue face me neeche ka background crop na ho
+                    pad_x, pad_y = int(face_w * 0.08), int(face_h * 0.08)
                     h, w = img.shape[:2]
                     
                     crop_x1 = max(0, x1 - pad_x)
@@ -497,14 +496,19 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
             return
         
         current_ai_person_count = folder_doc.totalPersonCount or 0
-        new_ai_persons_detected = len(cluster_groups)
-
         created_subfolders = []
+        folder_counter = 1
+
         for group_id, group_data in cluster_groups.items():
+            
+            if group_data["max_score"] < 0.78: 
+                print(f"⚠️ Skipping folder creation for cluster {group_id} because max face score is too low ({group_data['max_score']})")
+                continue
+
             person_id = str(uuid.uuid4())
             crop_key, crop_url = upload_face_crop(group_data["best_crop"], folderId, person_id)
 
-            display_name = f"Person"
+            display_name = f"HumanTag {folder_counter}"
 
             subfolder = SubFolder(
                 folderName=display_name,
@@ -526,8 +530,11 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                 "images": group_data["images"]
             })
 
+            folder_counter += 1
+
+        new_ai_persons_detected = len(created_subfolders)
         folder_doc.totalPersonCount = current_ai_person_count + new_ai_persons_detected
-        folder_doc.uniqueFaceCount = len(cluster_groups)
+        folder_doc.uniqueFaceCount = new_ai_persons_detected
         folder_doc.save()
         print("✅ Folder Database Setup Success")
 
