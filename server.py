@@ -399,7 +399,7 @@ def upload_face_crop(face_crop, folder_id, person_id):
 
 def process_face_clustering_in_background(image_keys, folderId, userId, folder_name):
     try:
-        print(f"Total Images Found hello = {len(image_keys)}")
+        print(f"Total Images Found = {len(image_keys)}")
         all_embeddings = []
         face_metadata = []
 
