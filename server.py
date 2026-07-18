@@ -423,32 +423,33 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                 if not faces:
                     continue
 
-                if len(faces) > 1:
-                    face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
-                else:
-                    face = faces[0]
 
-                det_score = getattr(face, 'det_score', 1.0)
-                if det_score < 0.70:  
-                    continue
+                for face in faces:
+                    det_score = getattr(face, 'det_score', 1.0)
+                    if det_score < 0.65: 
+                        continue
 
-                x1, y1, x2, y2 = map(int, face.bbox)
-                face_w, face_h = x2 - x1, y2 - y1
-                pad_x, pad_y = int(face_w * 0.20), int(face_h * 0.20)
-                h, w = img.shape[:2]
-                
-                crop_x1 = max(0, x1 - pad_x)
-                crop_y1 = max(0, y1 - pad_y)
-                crop_x2 = min(w, x2 + pad_x)
-                crop_y2 = min(h, y2 + pad_y)
-                face_crop = img[crop_y1:crop_y2, crop_x1:crop_x2]
+                    x1, y1, x2, y2 = map(int, face.bbox)
+                    face_w, face_h = x2 - x1, y2 - y1
+                    
+                    if face_w < 35 or face_h < 35:
+                        continue
 
-                all_embeddings.append(face.embedding)
-                face_metadata.append({
-                    "key": key,
-                    "face_crop": face_crop.copy() if face_crop.size > 0 else img[y1:y2, x1:x2],
-                    "det_score": det_score
-                })
+                    pad_x, pad_y = int(face_w * 0.20), int(face_h * 0.20)
+                    h, w = img.shape[:2]
+                    
+                    crop_x1 = max(0, x1 - pad_x)
+                    crop_y1 = max(0, y1 - pad_y)
+                    crop_x2 = min(w, x2 + pad_x)
+                    crop_y2 = min(h, y2 + pad_y)
+                    face_crop = img[crop_y1:crop_y2, crop_x1:crop_x2]
+
+                    all_embeddings.append(face.embedding)
+                    face_metadata.append({
+                        "key": key,
+                        "face_crop": face_crop.copy() if face_crop.size > 0 else img[y1:y2, x1:x2],
+                        "det_score": det_score
+                    })
 
         if not all_embeddings:
             print("⚠️ No faces detected in the given images.")
@@ -480,7 +481,9 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                     "max_score": metadata["det_score"]
                 }
             
-            cluster_groups[current_group_id]["images"].append(metadata["key"])
+            if metadata["key"] not in cluster_groups[current_group_id]["images"]:
+                cluster_groups[current_group_id]["images"].append(metadata["key"])
+                
             if metadata["det_score"] > cluster_groups[current_group_id]["max_score"]:
                 cluster_groups[current_group_id]["best_crop"] = metadata["face_crop"]
                 cluster_groups[current_group_id]["max_score"] = metadata["det_score"]
@@ -494,7 +497,6 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
             return
         
         current_ai_person_count = folder_doc.totalPersonCount or 0
-        
         new_ai_persons_detected = len(cluster_groups)
 
         created_subfolders = []
@@ -525,7 +527,6 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
             })
 
         folder_doc.totalPersonCount = current_ai_person_count + new_ai_persons_detected
-
         folder_doc.uniqueFaceCount = len(cluster_groups)
         folder_doc.save()
         print("✅ Folder Database Setup Success")
@@ -548,7 +549,6 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
 
     except Exception as e:
         print(f"❌ Error in background face recognition: {str(e)}")
-
 
 @app.post("/count-unique-persons")
 async def count_unique_persons(
