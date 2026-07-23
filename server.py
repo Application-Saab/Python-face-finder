@@ -33,12 +33,13 @@ from database import connect_db
 from dotenv import load_dotenv
 load_dotenv()
 from fastapi import BackgroundTasks
-
+from fastapi import APIRouter, Form, HTTPException
 from eventFaceFinder import router as event_router
 
 
 
-
+s3_client = boto3.client('s3') 
+BUCKET_NAME = "photography-hora"
 AWS_REGION = os.getenv("AWS_REGION", "eu-north-1")
 S3_BUCKET = os.getenv("S3_BUCKET_NAME", "photography-hora")
 
@@ -371,6 +372,255 @@ async def search_faces_s3(
         searcher.stream_search_batch(s3_prefix, reference_embedding, subFolderId),
         media_type="text/event-stream",
     )
+
+
+
+
+def get_best_banner_image(image_keys: list) -> str:
+    """
+    Candidates S3 keys me se sabse best resolution, contrast aur clarity 
+    wali image select karta hai.
+    """
+    if not image_keys:
+        return None
+    if len(image_keys) == 1:
+        return image_keys[0]
+
+    best_key = image_keys[0]
+    best_score = -1.0
+
+    # Quick test ke liye limit kar sakte hain (e.g. top 10 candidates)
+    candidates_to_test = image_keys[:10] 
+
+    for key in candidates_to_test:
+        try:
+            # S3 se image fetch karo
+            s3_obj = s3_client.get_object(Bucket=BUCKET_NAME, Key=key)
+            img_bytes = s3_obj['Body'].read()
+            
+            # Convert to OpenCV image
+            nparr = np.frombuffer(img_bytes, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+            if img is None:
+                continue
+
+            # 1. Resolution / Sharpness Check (Laplacian Variance)
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
+
+            # 2. Resolution Weight
+            height, width, _ = img.shape
+            megapixels = (width * height) / 1000000.0
+
+            # 3. Final Composite Quality Score
+            score = sharpness * 0.7 + megapixels * 30.0
+
+            if score > best_score:
+                best_score = score
+                best_key = key
+
+        except Exception as e:
+            print(f"⚠️ Image score error for {key}: {str(e)}")
+            continue
+
+    return best_key
+
+
+# Helper function to filter group photos by strict tag count (avoid extra crowd)
+def filter_clean_vip_photos(candidate_keys: list, vip_count: int, max_extra_people: int = 1) -> list:
+    """
+    Candidate images me se sirf wo images filter karta hai jisme 
+    total tagged subfolders (folderIds) <= (VIP Count + max_extra_people).
+    """
+    clean_candidates = []
+    max_allowed = vip_count + max_extra_people
+
+    for key in candidate_keys:
+        link_doc = WebLinks.objects(originalKey=key).first() or WebLinks.objects(thumbnailKey=key).first()
+        if link_doc and link_doc.folderIds:
+            # Agar image me total tagged log control limit ke andar hain
+            if len(link_doc.folderIds) <= max_allowed:
+                clean_candidates.append(key)
+
+    # Agar strict filter me koi image bache toh return karo, warna fallback to original candidates
+    return clean_candidates if clean_candidates else candidate_keys
+
+
+# =========================================================
+# TEST ENDPOINT: TEST BANNER LOGIC ON EXISTING FOLDERS
+# =========================================================
+@app.post("/test-existing-banner")
+async def test_existing_banner(
+    folderId: str = Form(...) # Bas Main Folder Ki String ID Deni Hai
+):
+    try:
+        # 1. Main Folder Document Fetch
+        folder_doc = Folder.objects(id=folderId).first()
+        if not folder_doc:
+            raise HTTPException(status_code=404, detail="Folder not found")
+
+        # 2. Extract Person SubFolders
+        subfolders = folder_doc.subFolders or []
+        person_subfolders = [
+            sub for sub in subfolders if getattr(sub, 'isPersonFolder', False)
+        ]
+
+        if not person_subfolders:
+            return {
+                "success": False, 
+                "message": "Is folder me koi person subfolders nahi mile."
+            }
+
+        # 3. WebLinks Query karke har person ki images aur URLs nikalo
+        person_clusters = []
+        all_event_images = set()
+
+        for sub in person_subfolders:
+            sub_id = str(sub._id)
+            links = WebLinks.objects(folderIds=sub_id)
+            
+            valid_links = []
+            for link in links:
+                key = link.originalKey or link.thumbnailKey
+                url = link.originalUrl or link.thumbnailImageUrl
+                if key and url:
+                    valid_links.append({"key": key, "url": url})
+
+            if valid_links:
+                image_keys = [item["key"] for item in valid_links]
+                person_clusters.append({
+                    "subFolderId": sub_id,
+                    "folderName": sub.folderName,
+                    "count": len(valid_links),
+                    "images": image_keys,
+                    "links": valid_links
+                })
+                all_event_images.update(image_keys)
+
+        total_images_count = len(all_event_images)
+        print(f"\n📊 Total Unique Event Photos in DB: {total_images_count}")
+
+        if not person_clusters:
+            return {
+                "success": False, 
+                "message": "Subfolders mile par unse tagged images (WebLinks) nahi mile."
+            }
+
+        # 4. Count ke basis par High-to-Low Sort
+        sorted_groups = sorted(person_clusters, key=lambda x: x["count"], reverse=True)
+
+        # -------------------------------------------------------------
+        # 🎯 ADAPTIVE VIP LOGIC
+        # -------------------------------------------------------------
+        min_photos_threshold = max(int(total_images_count * 0.10), 10)
+        vip_groups = []
+
+        for i, group in enumerate(sorted_groups):
+            count = group["count"]
+            if count < min_photos_threshold:
+                break
+            if i == 0:
+                vip_groups.append(group)
+                continue
+                
+            prev_count = sorted_groups[i-1]["count"]
+            if count >= (prev_count * 0.50):
+                vip_groups.append(group)
+            else:
+                break
+
+        vip_count = len(vip_groups)
+        print(f"👥 VIP Persons Count: {vip_count}")
+
+        # -------------------------------------------------------------
+        # 🖼️ GET EACH VIP'S INDIVIDUAL PHOTO URL & PRINT
+        # -------------------------------------------------------------
+        vip_details = []
+        main_persons_image_sets = []
+
+        print("\n==================================================")
+        print(f"👤 IDENTIFIED VIP PERSONS ({vip_count} Found):")
+        print("--------------------------------------------------")
+
+        for idx, vip in enumerate(vip_groups, 1):
+            main_persons_image_sets.append(set(vip["images"]))
+            
+            # Subfolder ke andar ki main individual photo URL
+            sample_url = vip["links"][0]["url"] if vip["links"] else "N/A"
+            
+            vip_info = {
+                "vipNumber": idx,
+                "folderName": vip["folderName"],
+                "subFolderId": vip["subFolderId"],
+                "totalPhotos": vip["count"],
+                "samplePhotoUrl": sample_url
+            }
+            vip_details.append(vip_info)
+
+            print(f"🔹 VIP #{idx} | Name: {vip['folderName']} | Photos Count: {vip['count']}")
+            print(f"🔗 Individual Image URL: {sample_url}\n")
+
+        # -------------------------------------------------------------
+        # 🎯 BANNER SELECTION LOGIC (WITH CLEAN GROUP FILTERING)
+        # -------------------------------------------------------------
+        selected_banner_key = None
+
+        if vip_count > 1:
+            # 1. Common Group Photo Candidates
+            common_all = set.intersection(*main_persons_image_sets)
+            if common_all:
+                # Extra crowd/people filter: Allow max 1 extra person in tag count
+                clean_candidates = filter_clean_vip_photos(list(common_all), vip_count=vip_count, max_extra_people=1)
+                selected_banner_key = get_best_banner_image(clean_candidates)
+                
+            if not selected_banner_key and vip_count >= 3:
+                top_2_common = set.intersection(main_persons_image_sets[0], main_persons_image_sets[1])
+                if top_2_common:
+                    clean_candidates = filter_clean_vip_photos(list(top_2_common), vip_count=2, max_extra_people=1)
+                    selected_banner_key = get_best_banner_image(clean_candidates)
+
+            if not selected_banner_key:
+                union_all = set.union(*main_persons_image_sets)
+                clean_candidates = filter_clean_vip_photos(list(union_all), vip_count=vip_count, max_extra_people=1)
+                selected_banner_key = get_best_banner_image(clean_candidates)
+                
+        elif vip_count == 1:
+            clean_candidates = filter_clean_vip_photos(list(main_persons_image_sets[0]), vip_count=1, max_extra_people=0)
+            selected_banner_key = get_best_banner_image(clean_candidates)
+        else:
+            selected_banner_key = get_best_banner_image(sorted_groups[0]["images"])
+
+        # Final Banner URL Fetch
+        banner_url = None
+        if selected_banner_key:
+            banner_doc = WebLinks.objects(originalKey=selected_banner_key).first() or \
+                         WebLinks.objects(thumbnailKey=selected_banner_key).first()
+            if banner_doc:
+                banner_url = banner_doc.originalUrl or banner_doc.thumbnailImageUrl
+
+        # Terminal Final Output
+        print("--------------------------------------------------")
+        print("🔥 TESTING BANNER RESULT (READ-ONLY)")
+        print(f"📌 Main Folder ID    : {folderId}")
+        print(f"📌 Total SubFolders  : {len(person_subfolders)}")
+        print(f"📌 VIPs Identified   : {vip_count}")
+        print(f"📌 Selected Key      : {selected_banner_key}")
+        print(f"🔗 Banner File URL   : {banner_url}")
+        print("==================================================\n")
+
+        return {
+            "success": True,
+            "folderId": folderId,
+            "vipCount": vip_count,
+            "vips": vip_details,
+            "selectedBannerKey": selected_banner_key,
+            "bannerUrl": banner_url
+        }
+
+    except Exception as e:
+        print(f"❌ Error in test endpoint: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 EPS = 0.6
