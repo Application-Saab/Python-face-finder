@@ -33,8 +33,10 @@ from database import connect_db
 from dotenv import load_dotenv
 load_dotenv()
 from fastapi import BackgroundTasks
-from fastapi import APIRouter, Form, HTTPException
+from fastapi import Form, HTTPException
 from eventFaceFinder import router as event_router
+import gc 
+from datetime import datetime
 
 
 
@@ -374,12 +376,17 @@ async def search_faces_s3(
     )
 
 
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
 
-def get_best_banner_image(image_keys: list) -> str:
+# =========================================================
+# 1. UPDATED: OPENCV FRONT-FACE & QUALITY SCORING
+# =========================================================
+def get_best_banner_image(image_keys: list, expected_vip_count: int) -> str:
     """
-    Candidates S3 keys me se sabse best resolution, contrast aur clarity 
-    wali image select karta hai.
+    Candidates me se aisi image pick karta hai jisme:
+    1. Maximum Front-facing Faces detect hon (Matching expected VIP count).
+    2. Image Sharpness (Laplacian) aur Resolution high ho.
     """
     if not image_keys:
         return None
@@ -389,36 +396,44 @@ def get_best_banner_image(image_keys: list) -> str:
     best_key = image_keys[0]
     best_score = -1.0
 
-    # Quick test ke liye limit kar sakte hain (e.g. top 10 candidates)
-    candidates_to_test = image_keys[:10] 
+    candidates_to_test = image_keys[:10]
 
     for key in candidates_to_test:
         try:
-            # S3 se image fetch karo
             s3_obj = s3_client.get_object(Bucket=BUCKET_NAME, Key=key)
             img_bytes = s3_obj['Body'].read()
-            
-            # Convert to OpenCV image
+
             nparr = np.frombuffer(img_bytes, np.uint8)
             img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
             if img is None:
                 continue
 
-            # 1. Resolution / Sharpness Check (Laplacian Variance)
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
             sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
 
-            # 2. Resolution Weight
             height, width, _ = img.shape
             megapixels = (width * height) / 1000000.0
 
-            # 3. Final Composite Quality Score
-            score = sharpness * 0.7 + megapixels * 30.0
+            faces = face_cascade.detectMultiScale(
+                gray, 
+                scaleFactor=1.1, 
+                minNeighbors=5, 
+                minSize=(30, 30)
+            )
+            detected_faces_count = len(faces)
+
+            face_score_multiplier = 1.0 + (min(detected_faces_count, expected_vip_count) * 0.5)
+
+            score = ((sharpness * 0.6) + (megapixels * 20.0)) * face_score_multiplier
 
             if score > best_score:
                 best_score = score
                 best_key = key
+
+            del img_bytes, nparr, img, gray
+            gc.collect()
 
         except Exception as e:
             print(f"⚠️ Image score error for {key}: {str(e)}")
@@ -427,40 +442,36 @@ def get_best_banner_image(image_keys: list) -> str:
     return best_key
 
 
-# Helper function to filter group photos by strict tag count (avoid extra crowd)
-def filter_clean_vip_photos(candidate_keys: list, vip_count: int, max_extra_people: int = 1) -> list:
+# =========================================================
+# 2. UPDATED: STRICT VIP-ONLY FILTER (EXACT COUNT MATCH)
+# =========================================================
+def filter_strict_vip_photos(candidate_keys: list, exact_vip_count: int) -> list:
     """
-    Candidate images me se sirf wo images filter karta hai jisme 
-    total tagged subfolders (folderIds) <= (VIP Count + max_extra_people).
+    Candidate list me se SIRF wahi photos Filter karta hai jisme:
+    len(folderIds) == exact_vip_count (Zero Extra Crowd/Guests)
     """
     clean_candidates = []
-    max_allowed = vip_count + max_extra_people
 
     for key in candidate_keys:
         link_doc = WebLinks.objects(originalKey=key).first() or WebLinks.objects(thumbnailKey=key).first()
         if link_doc and link_doc.folderIds:
-            # Agar image me total tagged log control limit ke andar hain
-            if len(link_doc.folderIds) <= max_allowed:
+            if len(link_doc.folderIds) == exact_vip_count:
                 clean_candidates.append(key)
 
-    # Agar strict filter me koi image bache toh return karo, warna fallback to original candidates
     return clean_candidates if clean_candidates else candidate_keys
 
-
 # =========================================================
-# TEST ENDPOINT: TEST BANNER LOGIC ON EXISTING FOLDERS
+# TEST ENDPOINT: FRONT-FACE + STRICT VIP BANNER LOGIC
 # =========================================================
 @app.post("/test-existing-banner")
 async def test_existing_banner(
-    folderId: str = Form(...) # Bas Main Folder Ki String ID Deni Hai
+    folderId: str = Form(...) # Main Folder ID
 ):
     try:
-        # 1. Main Folder Document Fetch
         folder_doc = Folder.objects(id=folderId).first()
         if not folder_doc:
             raise HTTPException(status_code=404, detail="Folder not found")
 
-        # 2. Extract Person SubFolders
         subfolders = folder_doc.subFolders or []
         person_subfolders = [
             sub for sub in subfolders if getattr(sub, 'isPersonFolder', False)
@@ -472,7 +483,6 @@ async def test_existing_banner(
                 "message": "Is folder me koi person subfolders nahi mile."
             }
 
-        # 3. WebLinks Query karke har person ki images aur URLs nikalo
         person_clusters = []
         all_event_images = set()
 
@@ -507,12 +517,8 @@ async def test_existing_banner(
                 "message": "Subfolders mile par unse tagged images (WebLinks) nahi mile."
             }
 
-        # 4. Count ke basis par High-to-Low Sort
         sorted_groups = sorted(person_clusters, key=lambda x: x["count"], reverse=True)
 
-        # -------------------------------------------------------------
-        # 🎯 ADAPTIVE VIP LOGIC
-        # -------------------------------------------------------------
         min_photos_threshold = max(int(total_images_count * 0.10), 10)
         vip_groups = []
 
@@ -533,9 +539,6 @@ async def test_existing_banner(
         vip_count = len(vip_groups)
         print(f"👥 VIP Persons Count: {vip_count}")
 
-        # -------------------------------------------------------------
-        # 🖼️ GET EACH VIP'S INDIVIDUAL PHOTO URL & PRINT
-        # -------------------------------------------------------------
         vip_details = []
         main_persons_image_sets = []
 
@@ -546,7 +549,6 @@ async def test_existing_banner(
         for idx, vip in enumerate(vip_groups, 1):
             main_persons_image_sets.append(set(vip["images"]))
             
-            # Subfolder ke andar ki main individual photo URL
             sample_url = vip["links"][0]["url"] if vip["links"] else "N/A"
             
             vip_info = {
@@ -561,37 +563,31 @@ async def test_existing_banner(
             print(f"🔹 VIP #{idx} | Name: {vip['folderName']} | Photos Count: {vip['count']}")
             print(f"🔗 Individual Image URL: {sample_url}\n")
 
-        # -------------------------------------------------------------
-        # 🎯 BANNER SELECTION LOGIC (WITH CLEAN GROUP FILTERING)
-        # -------------------------------------------------------------
         selected_banner_key = None
 
         if vip_count > 1:
-            # 1. Common Group Photo Candidates
             common_all = set.intersection(*main_persons_image_sets)
             if common_all:
-                # Extra crowd/people filter: Allow max 1 extra person in tag count
-                clean_candidates = filter_clean_vip_photos(list(common_all), vip_count=vip_count, max_extra_people=1)
-                selected_banner_key = get_best_banner_image(clean_candidates)
-                
+                clean_candidates = filter_strict_vip_photos(list(common_all), exact_vip_count=vip_count)
+                selected_banner_key = get_best_banner_image(clean_candidates, expected_vip_count=vip_count)
+
             if not selected_banner_key and vip_count >= 3:
                 top_2_common = set.intersection(main_persons_image_sets[0], main_persons_image_sets[1])
                 if top_2_common:
-                    clean_candidates = filter_clean_vip_photos(list(top_2_common), vip_count=2, max_extra_people=1)
-                    selected_banner_key = get_best_banner_image(clean_candidates)
+                    clean_candidates = filter_strict_vip_photos(list(top_2_common), exact_vip_count=2)
+                    selected_banner_key = get_best_banner_image(clean_candidates, expected_vip_count=2)
 
             if not selected_banner_key:
                 union_all = set.union(*main_persons_image_sets)
-                clean_candidates = filter_clean_vip_photos(list(union_all), vip_count=vip_count, max_extra_people=1)
-                selected_banner_key = get_best_banner_image(clean_candidates)
-                
-        elif vip_count == 1:
-            clean_candidates = filter_clean_vip_photos(list(main_persons_image_sets[0]), vip_count=1, max_extra_people=0)
-            selected_banner_key = get_best_banner_image(clean_candidates)
-        else:
-            selected_banner_key = get_best_banner_image(sorted_groups[0]["images"])
+                clean_candidates = filter_strict_vip_photos(list(union_all), exact_vip_count=vip_count)
+                selected_banner_key = get_best_banner_image(clean_candidates, expected_vip_count=vip_count)
 
-        # Final Banner URL Fetch
+        elif vip_count == 1:
+            clean_candidates = filter_strict_vip_photos(list(main_persons_image_sets[0]), exact_vip_count=1)
+            selected_banner_key = get_best_banner_image(clean_candidates, expected_vip_count=1)
+        else:
+            selected_banner_key = get_best_banner_image(sorted_groups[0]["images"], expected_vip_count=1)
+
         banner_url = None
         if selected_banner_key:
             banner_doc = WebLinks.objects(originalKey=selected_banner_key).first() or \
@@ -599,23 +595,33 @@ async def test_existing_banner(
             if banner_doc:
                 banner_url = banner_doc.originalUrl or banner_doc.thumbnailImageUrl
 
-        # Terminal Final Output
+        db_updated = False
+        if banner_url:
+            folder_doc.bannerImageUrl = banner_url
+            folder_doc.updatedAt = datetime.utcnow()
+            folder_doc.save()
+            db_updated = True
+            print(f"✅ DB Update Successful: bannerImageUrl set to {banner_url}")
+
         print("--------------------------------------------------")
-        print("🔥 TESTING BANNER RESULT (READ-ONLY)")
+        print("🔥 BANNER RESULT SAVED TO DB SUCCESSFULLY")
         print(f"📌 Main Folder ID    : {folderId}")
         print(f"📌 Total SubFolders  : {len(person_subfolders)}")
         print(f"📌 VIPs Identified   : {vip_count}")
         print(f"📌 Selected Key      : {selected_banner_key}")
         print(f"🔗 Banner File URL   : {banner_url}")
+        print(f"💾 Database Saved    : {db_updated}")
         print("==================================================\n")
 
         return {
             "success": True,
+            "message": "Banner calculated and stored in Database successfully." if db_updated else "Banner processed but no URL found.",
             "folderId": folderId,
             "vipCount": vip_count,
             "vips": vip_details,
             "selectedBannerKey": selected_banner_key,
-            "bannerUrl": banner_url
+            "bannerUrl": banner_url,
+            "isSavedToDb": db_updated
         }
 
     except Exception as e:
