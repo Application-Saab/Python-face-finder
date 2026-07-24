@@ -376,17 +376,20 @@ async def search_faces_s3(
     )
 
 
+# OpenCV Haar Cascade Frontal Face Detector Load Karo
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
 
 # =========================================================
-# 1. UPDATED: OPENCV FRONT-FACE & QUALITY SCORING
+# 1. OPTIMIZED: LOW-RES WEBP THUMBNAIL + BATCH PROCESSING (RAM & CPU SAFE)
 # =========================================================
 def get_best_banner_image(image_keys: list, expected_vip_count: int) -> str:
     """
     Candidates me se aisi image pick karta hai jisme:
-    1. Maximum Front-facing Faces detect hon (Matching expected VIP count).
-    2. Image Sharpness (Laplacian) aur Resolution high ho.
+    1. Low-Res WebP Thumbnail use hoti hai (RAM/CPU protection ke liye).
+    2. Batch Processing (10-10 ke batch) se memory leaks avoid hoti hain.
+    3. Aspect Ratio Landscape ho (width > height) taaki UI na fate.
+    4. Maximum Front-facing Faces detect hon (Matching expected VIP count).
     """
     if not image_keys:
         return None
@@ -396,54 +399,92 @@ def get_best_banner_image(image_keys: list, expected_vip_count: int) -> str:
     best_key = image_keys[0]
     best_score = -1.0
 
-    candidates_to_test = image_keys[:10]
+    # Top 20 Candidates to test
+    candidates_to_test = image_keys[:20]
+    BATCH_SIZE = 10  # 🎯 BATCH PROCESSING SIZE
 
-    for key in candidates_to_test:
-        try:
-            s3_obj = s3_client.get_object(Bucket=BUCKET_NAME, Key=key)
-            img_bytes = s3_obj['Body'].read()
+    # Process candidates in batches of 10
+    for batch_start in range(0, len(candidates_to_test), BATCH_SIZE):
+        batch_candidates = candidates_to_test[batch_start : batch_start + BATCH_SIZE]
 
-            nparr = np.frombuffer(img_bytes, np.uint8)
-            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        for key in batch_candidates:
+            try:
+                # ---------------------------------------------------------
+                # ⚡ OPTIMIZATION 1: WEBP / THUMBNAIL KEY FETCH
+                # ---------------------------------------------------------
+                link_doc = WebLinks.objects(originalKey=key).first() or WebLinks.objects(thumbnailKey=key).first()
+                
+                # Heavy originalKey ke bajaye light WebP thumbnailKey S3 se fetch karenge
+                target_s3_key = (link_doc.thumbnailKey if link_doc and link_doc.thumbnailKey else key)
 
-            if img is None:
+                # S3 se Low-Res WebP fetch (RAM Buffer ~100KB instead of 10MB)
+                s3_obj = s3_client.get_object(Bucket=BUCKET_NAME, Key=target_s3_key)
+                img_bytes = s3_obj['Body'].read()
+
+                nparr = np.frombuffer(img_bytes, np.uint8)
+                # OpenCV handles WebP natively
+                img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+                if img is None:
+                    continue
+
+                height, width, _ = img.shape
+                
+                # ---------------------------------------------------------
+                # 📐 ASPECT RATIO & LANDSCAPE FILTER (UI FIX)
+                # ---------------------------------------------------------
+                aspect_ratio = width / float(height)
+
+                # Portrait / Vertical photos filter out
+                if aspect_ratio < 1.1: 
+                    del img_bytes, nparr, img
+                    continue
+
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+                # 1. Sharpness (Laplacian Variance)
+                sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
+
+                # 2. Megapixels Resolution
+                megapixels = (width * height) / 1000000.0
+
+                # 3. Front Face Detection (Adjusted minSize for WebP thumbnails)
+                faces = face_cascade.detectMultiScale(
+                    gray, 
+                    scaleFactor=1.1, 
+                    minNeighbors=5, 
+                    minSize=(20, 20)
+                )
+                detected_faces_count = len(faces)
+
+                # 🎯 SCORING FORMULA
+                face_score_multiplier = 1.0 + (min(detected_faces_count, expected_vip_count) * 0.5)
+                aspect_ratio_multiplier = min(aspect_ratio, 1.8) 
+
+                score = ((sharpness * 0.6) + (megapixels * 20.0)) * face_score_multiplier * aspect_ratio_multiplier
+
+                if score > best_score:
+                    best_score = score
+                    # Return original key for DB storage
+                    best_key = key
+
+                # Per-image cleanup
+                del img_bytes, nparr, img, gray
+
+            except Exception as e:
+                print(f"⚠️ Image score error for {key}: {str(e)}")
                 continue
 
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-            sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
-
-            height, width, _ = img.shape
-            megapixels = (width * height) / 1000000.0
-
-            faces = face_cascade.detectMultiScale(
-                gray, 
-                scaleFactor=1.1, 
-                minNeighbors=5, 
-                minSize=(30, 30)
-            )
-            detected_faces_count = len(faces)
-
-            face_score_multiplier = 1.0 + (min(detected_faces_count, expected_vip_count) * 0.5)
-
-            score = ((sharpness * 0.6) + (megapixels * 20.0)) * face_score_multiplier
-
-            if score > best_score:
-                best_score = score
-                best_key = key
-
-            del img_bytes, nparr, img, gray
-            gc.collect()
-
-        except Exception as e:
-            print(f"⚠️ Image score error for {key}: {str(e)}")
-            continue
+        # ---------------------------------------------------------
+        # ⚡ OPTIMIZATION 2: FORCE GARBAGE COLLECTION PER BATCH
+        # ---------------------------------------------------------
+        gc.collect()
 
     return best_key
 
 
 # =========================================================
-# 2. UPDATED: STRICT VIP-ONLY FILTER (EXACT COUNT MATCH)
+# 2. STRICT VIP-ONLY FILTER (EXACT COUNT MATCH)
 # =========================================================
 def filter_strict_vip_photos(candidate_keys: list, exact_vip_count: int) -> list:
     """
@@ -460,6 +501,7 @@ def filter_strict_vip_photos(candidate_keys: list, exact_vip_count: int) -> list
 
     return clean_candidates if clean_candidates else candidate_keys
 
+
 # =========================================================
 # TEST ENDPOINT: FRONT-FACE + STRICT VIP BANNER LOGIC
 # =========================================================
@@ -468,10 +510,25 @@ async def test_existing_banner(
     folderId: str = Form(...) # Main Folder ID
 ):
     try:
+        # 1. Main Folder Fetch
         folder_doc = Folder.objects(id=folderId).first()
         if not folder_doc:
             raise HTTPException(status_code=404, detail="Folder not found")
 
+        # -------------------------------------------------------------
+        # 🚀 STARTING TERMINAL LOG (Folder Name + Order ID)
+        # -------------------------------------------------------------
+        folder_name = getattr(folder_doc, 'folderName', 'N/A')
+        order_id = getattr(folder_doc, 'orderId', 'N/A')
+
+        print("\n==================================================")
+        print("🚀 PROCESSING BANNER FOR FOLDER")
+        print(f"📌 Folder ID   : {folderId}")
+        print(f"📂 Folder Name : {folder_name}")
+        print(f"📦 Order ID          : {int(order_id) + 10800 if str(order_id).isdigit() else order_id}")
+        print("==================================================\n")
+
+        # 2. Extract Person SubFolders
         subfolders = folder_doc.subFolders or []
         person_subfolders = [
             sub for sub in subfolders if getattr(sub, 'isPersonFolder', False)
@@ -509,7 +566,7 @@ async def test_existing_banner(
                 all_event_images.update(image_keys)
 
         total_images_count = len(all_event_images)
-        print(f"\n📊 Total Unique Event Photos in DB: {total_images_count}")
+        print(f"📊 Total Unique Event Photos in DB: {total_images_count}")
 
         if not person_clusters:
             return {
@@ -542,7 +599,7 @@ async def test_existing_banner(
         vip_details = []
         main_persons_image_sets = []
 
-        print("\n==================================================")
+        print("\n--------------------------------------------------")
         print(f"👤 IDENTIFIED VIP PERSONS ({vip_count} Found):")
         print("--------------------------------------------------")
 
@@ -593,7 +650,7 @@ async def test_existing_banner(
             banner_doc = WebLinks.objects(originalKey=selected_banner_key).first() or \
                          WebLinks.objects(thumbnailKey=selected_banner_key).first()
             if banner_doc:
-                banner_url = banner_doc.originalUrl or banner_doc.thumbnailImageUrl
+                banner_url = banner_doc.thumbnailImageUrl or banner_doc.originalUrl
 
         db_updated = False
         if banner_url:
@@ -606,6 +663,8 @@ async def test_existing_banner(
         print("--------------------------------------------------")
         print("🔥 BANNER RESULT SAVED TO DB SUCCESSFULLY")
         print(f"📌 Main Folder ID    : {folderId}")
+        print(f"📂 Main Folder Name  : {folder_name}")
+        print(f"📦 Order ID          : {int(order_id) + 10800 if str(order_id).isdigit() else order_id}")
         print(f"📌 Total SubFolders  : {len(person_subfolders)}")
         print(f"📌 VIPs Identified   : {vip_count}")
         print(f"📌 Selected Key      : {selected_banner_key}")
@@ -617,6 +676,8 @@ async def test_existing_banner(
             "success": True,
             "message": "Banner calculated and stored in Database successfully." if db_updated else "Banner processed but no URL found.",
             "folderId": folderId,
+            "folderName": folder_name,
+            "orderId": order_id,
             "vipCount": vip_count,
             "vips": vip_details,
             "selectedBannerKey": selected_banner_key,
@@ -627,8 +688,6 @@ async def test_existing_banner(
     except Exception as e:
         print(f"❌ Error in test endpoint: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
-
 EPS = 0.6
 MIN_SAMPLES = 2
 
