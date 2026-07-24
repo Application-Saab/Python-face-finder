@@ -502,43 +502,36 @@ def filter_strict_vip_photos(candidate_keys: list, exact_vip_count: int) -> list
     return clean_candidates if clean_candidates else candidate_keys
 
 
-# =========================================================
-# TEST ENDPOINT: FRONT-FACE + STRICT VIP BANNER LOGIC
-# =========================================================
-@app.post("/test-existing-banner")
-async def test_existing_banner(
-    folderId: str = Form(...) # Main Folder ID
-):
+
+
+def generate_and_save_folder_banner(folderId: str) -> dict:
+    """
+    Clustering ke baad automatic run hone wala banner generator function.
+    """
     try:
-        # 1. Main Folder Fetch
         folder_doc = Folder.objects(id=folderId).first()
         if not folder_doc:
-            raise HTTPException(status_code=404, detail="Folder not found")
+            print(f"❌ Banner Error: Folder ID {folderId} not found")
+            return {"success": False, "message": "Folder not found"}
 
-        # -------------------------------------------------------------
-        # 🚀 STARTING TERMINAL LOG (Folder Name + Order ID)
-        # -------------------------------------------------------------
         folder_name = getattr(folder_doc, 'folderName', 'N/A')
         order_id = getattr(folder_doc, 'orderId', 'N/A')
 
         print("\n==================================================")
-        print("🚀 PROCESSING BANNER FOR FOLDER")
+        print("🚀 AUTOMATIC BANNER GENERATION STARTED")
         print(f"📌 Folder ID   : {folderId}")
         print(f"📂 Folder Name : {folder_name}")
         print(f"📦 Order ID          : {int(order_id) + 10800 if str(order_id).isdigit() else order_id}")
         print("==================================================\n")
 
-        # 2. Extract Person SubFolders
         subfolders = folder_doc.subFolders or []
         person_subfolders = [
             sub for sub in subfolders if getattr(sub, 'isPersonFolder', False)
         ]
 
         if not person_subfolders:
-            return {
-                "success": False, 
-                "message": "Is folder me koi person subfolders nahi mile."
-            }
+            print("⚠️ No person subfolders found for banner selection.")
+            return {"success": False, "message": "No person subfolders found"}
 
         person_clusters = []
         all_event_images = set()
@@ -566,16 +559,13 @@ async def test_existing_banner(
                 all_event_images.update(image_keys)
 
         total_images_count = len(all_event_images)
-        print(f"📊 Total Unique Event Photos in DB: {total_images_count}")
 
         if not person_clusters:
-            return {
-                "success": False, 
-                "message": "Subfolders mile par unse tagged images (WebLinks) nahi mile."
-            }
+            print("⚠️ Tagged WebLinks not found for subfolders.")
+            return {"success": False, "message": "No tagged WebLinks found"}
 
+        # VIP Identification Strategy
         sorted_groups = sorted(person_clusters, key=lambda x: x["count"], reverse=True)
-
         min_photos_threshold = max(int(total_images_count * 0.10), 10)
         vip_groups = []
 
@@ -594,31 +584,7 @@ async def test_existing_banner(
                 break
 
         vip_count = len(vip_groups)
-        print(f"👥 VIP Persons Count: {vip_count}")
-
-        vip_details = []
-        main_persons_image_sets = []
-
-        print("\n--------------------------------------------------")
-        print(f"👤 IDENTIFIED VIP PERSONS ({vip_count} Found):")
-        print("--------------------------------------------------")
-
-        for idx, vip in enumerate(vip_groups, 1):
-            main_persons_image_sets.append(set(vip["images"]))
-            
-            sample_url = vip["links"][0]["url"] if vip["links"] else "N/A"
-            
-            vip_info = {
-                "vipNumber": idx,
-                "folderName": vip["folderName"],
-                "subFolderId": vip["subFolderId"],
-                "totalPhotos": vip["count"],
-                "samplePhotoUrl": sample_url
-            }
-            vip_details.append(vip_info)
-
-            print(f"🔹 VIP #{idx} | Name: {vip['folderName']} | Photos Count: {vip['count']}")
-            print(f"🔗 Individual Image URL: {sample_url}\n")
+        main_persons_image_sets = [set(vip["images"]) for vip in vip_groups]
 
         selected_banner_key = None
 
@@ -652,42 +618,21 @@ async def test_existing_banner(
             if banner_doc:
                 banner_url = banner_doc.thumbnailImageUrl or banner_doc.originalUrl
 
-        db_updated = False
         if banner_url:
             folder_doc.bannerImageUrl = banner_url
             folder_doc.updatedAt = datetime.utcnow()
             folder_doc.save()
-            db_updated = True
             print(f"✅ DB Update Successful: bannerImageUrl set to {banner_url}")
-
-        print("--------------------------------------------------")
-        print("🔥 BANNER RESULT SAVED TO DB SUCCESSFULLY")
-        print(f"📌 Main Folder ID    : {folderId}")
-        print(f"📂 Main Folder Name  : {folder_name}")
-        print(f"📦 Order ID          : {int(order_id) + 10800 if str(order_id).isdigit() else order_id}")
-        print(f"📌 Total SubFolders  : {len(person_subfolders)}")
-        print(f"📌 VIPs Identified   : {vip_count}")
-        print(f"📌 Selected Key      : {selected_banner_key}")
-        print(f"🔗 Banner File URL   : {banner_url}")
-        print(f"💾 Database Saved    : {db_updated}")
-        print("==================================================\n")
-
-        return {
-            "success": True,
-            "message": "Banner calculated and stored in Database successfully." if db_updated else "Banner processed but no URL found.",
-            "folderId": folderId,
-            "folderName": folder_name,
-            "orderId": order_id,
-            "vipCount": vip_count,
-            "vips": vip_details,
-            "selectedBannerKey": selected_banner_key,
-            "bannerUrl": banner_url,
-            "isSavedToDb": db_updated
-        }
+            return {"success": True, "bannerUrl": banner_url, "selectedKey": selected_banner_key}
+        
+        return {"success": False, "message": "Banner key found but URL missing"}
 
     except Exception as e:
-        print(f"❌ Error in test endpoint: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"❌ Error in generate_and_save_folder_banner: {str(e)}")
+        return {"success": False, "error": str(e)}
+
+
+
 EPS = 0.6
 MIN_SAMPLES = 2
 
@@ -861,6 +806,26 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                 except Exception as e:
                     print(f"❌ Failed Tagging {image_key}: {str(e)}")
         print("\n✅ IMAGE TAGGING COMPLETED")
+
+        # -----------------------------------------------------
+        # SAFE ORDER ID EXTRACTION FOR LOGGING
+        # -----------------------------------------------------
+        raw_order_id = getattr(folder_doc, 'orderId', None) if 'folder_doc' in locals() and folder_doc else 'N/A'
+        
+        if str(raw_order_id).isdigit():
+            display_order_id = int(raw_order_id) + 10800
+        else:
+            display_order_id = raw_order_id if raw_order_id else 'N/A'
+
+        print(f"🎨 Generating Best Banner Image for Folder (Order ID: {display_order_id})...")
+        
+        # Call Banner Generator Function
+        banner_result = generate_and_save_folder_banner(folderId=folderId)
+        
+        if banner_result.get("success"):
+            print(f"🎉 Banner automatically assigned: {banner_result.get('bannerUrl')}")
+        else:
+            print(f"⚠️ Banner generation failed or skipped: {banner_result.get('message')}")
 
     except Exception as e:
         print(f"❌ Error in background face recognition: {str(e)}")
