@@ -385,11 +385,11 @@ face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_fronta
 # =========================================================
 def get_best_banner_image(image_keys: list, expected_vip_count: int) -> str:
     """
-    Candidates me se aisi image pick karta hai jisme:
-    1. Low-Res WebP Thumbnail use hoti hai (RAM/CPU protection ke liye).
-    2. Batch Processing (10-10 ke batch) se memory leaks avoid hoti hain.
-    3. Aspect Ratio Landscape ho (width > height) taaki UI na fate.
-    4. Maximum Front-facing Faces detect hon (Matching expected VIP count).
+    Selects the optimal banner image based on:
+    1. Low-Res WebP Thumbnail usage for RAM/CPU safety.
+    2. Batch Processing (10-by-10) to avoid memory leaks.
+    3. Landscape Aspect Ratio enforcement (width > height).
+    4. Exact VIP Face Count Priority (Penalizes extra crowd/guests visually detected).
     """
     if not image_keys:
         return None
@@ -399,30 +399,29 @@ def get_best_banner_image(image_keys: list, expected_vip_count: int) -> str:
     best_key = image_keys[0]
     best_score = -1.0
 
-    # Top 20 Candidates to test
+    # Test top 20 candidate images
     candidates_to_test = image_keys[:20]
-    BATCH_SIZE = 10  # 🎯 BATCH PROCESSING SIZE
+    BATCH_SIZE = 10
 
-    # Process candidates in batches of 10
+    # Process candidates in batches
     for batch_start in range(0, len(candidates_to_test), BATCH_SIZE):
         batch_candidates = candidates_to_test[batch_start : batch_start + BATCH_SIZE]
 
         for key in batch_candidates:
             try:
                 # ---------------------------------------------------------
-                # ⚡ OPTIMIZATION 1: WEBP / THUMBNAIL KEY FETCH
+                # ⚡ 1. WEBP / THUMBNAIL KEY FETCH (RAM OPTIMIZATION)
                 # ---------------------------------------------------------
                 link_doc = WebLinks.objects(originalKey=key).first() or WebLinks.objects(thumbnailKey=key).first()
                 
-                # Heavy originalKey ke bajaye light WebP thumbnailKey S3 se fetch karenge
+                # Fetch light WebP thumbnailKey from S3 instead of heavy original file
                 target_s3_key = (link_doc.thumbnailKey if link_doc and link_doc.thumbnailKey else key)
 
-                # S3 se Low-Res WebP fetch (RAM Buffer ~100KB instead of 10MB)
+                # Fetch object from S3 (~100KB buffer vs ~10MB)
                 s3_obj = s3_client.get_object(Bucket=BUCKET_NAME, Key=target_s3_key)
                 img_bytes = s3_obj['Body'].read()
 
                 nparr = np.frombuffer(img_bytes, np.uint8)
-                # OpenCV handles WebP natively
                 img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
                 if img is None:
@@ -431,24 +430,26 @@ def get_best_banner_image(image_keys: list, expected_vip_count: int) -> str:
                 height, width, _ = img.shape
                 
                 # ---------------------------------------------------------
-                # 📐 ASPECT RATIO & LANDSCAPE FILTER (UI FIX)
+                # 📐 2. ASPECT RATIO & LANDSCAPE FILTER (UI INTEGRITY)
                 # ---------------------------------------------------------
                 aspect_ratio = width / float(height)
 
-                # Portrait / Vertical photos filter out
+                # Filter out portrait or square images (Landscape required)
                 if aspect_ratio < 1.1: 
                     del img_bytes, nparr, img
                     continue
 
                 gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-                # 1. Sharpness (Laplacian Variance)
+                # Sharpness (Laplacian Variance)
                 sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
 
-                # 2. Megapixels Resolution
+                # Megapixels Resolution
                 megapixels = (width * height) / 1000000.0
 
-                # 3. Front Face Detection (Adjusted minSize for WebP thumbnails)
+                # ---------------------------------------------------------
+                # 👤 3. FRONT FACE DETECTION (OpenCV)
+                # ---------------------------------------------------------
                 faces = face_cascade.detectMultiScale(
                     gray, 
                     scaleFactor=1.1, 
@@ -457,18 +458,35 @@ def get_best_banner_image(image_keys: list, expected_vip_count: int) -> str:
                 )
                 detected_faces_count = len(faces)
 
-                # 🎯 SCORING FORMULA
-                face_score_multiplier = 1.0 + (min(detected_faces_count, expected_vip_count) * 0.5)
+                # ---------------------------------------------------------
+                # 🎯 4. SCORING FORMULA WITH STRICT CROWD PENALTY
+                # ---------------------------------------------------------
+                if detected_faces_count == expected_vip_count:
+                    # PERFECT MATCH: Exact number of detected faces matches VIP count
+                    face_score_multiplier = 2.0 
+
+                elif detected_faces_count > expected_vip_count:
+                    # CROWD PENALTY: Extra faces detected (VIPs + Crowd/Guests)
+                    extra_faces = detected_faces_count - expected_vip_count
+                    # Reduces score by 30% for every extra person found in photo
+                    face_score_multiplier = max(0.2, 1.0 - (extra_faces * 0.3))
+
+                else:
+                    # FEWER FACES: Less faces detected than expected VIP count
+                    face_score_multiplier = 0.5 if detected_faces_count > 0 else 0.2
+
+                # Cap aspect ratio boost to 1.8x
                 aspect_ratio_multiplier = min(aspect_ratio, 1.8) 
 
+                # Final Composite Score Calculation
                 score = ((sharpness * 0.6) + (megapixels * 20.0)) * face_score_multiplier * aspect_ratio_multiplier
 
                 if score > best_score:
                     best_score = score
-                    # Return original key for DB storage
+                    # Store original key for DB persistence
                     best_key = key
 
-                # Per-image cleanup
+                # Per-image memory cleanup
                 del img_bytes, nparr, img, gray
 
             except Exception as e:
@@ -476,31 +494,33 @@ def get_best_banner_image(image_keys: list, expected_vip_count: int) -> str:
                 continue
 
         # ---------------------------------------------------------
-        # ⚡ OPTIMIZATION 2: FORCE GARBAGE COLLECTION PER BATCH
+        # ⚡ 5. EXPLICIT GARBAGE COLLECTION PER BATCH
         # ---------------------------------------------------------
         gc.collect()
 
     return best_key
 
-
 # =========================================================
 # 2. STRICT VIP-ONLY FILTER (EXACT COUNT MATCH)
 # =========================================================
-def filter_strict_vip_photos(candidate_keys: list, exact_vip_count: int) -> list:
+# Updated filter function with explicit priority logs
+def filter_strict_vip_photos(candidate_keys: list, exact_vip_count: int) -> tuple[list, bool]:
     """
-    Candidate list me se SIRF wahi photos Filter karta hai jisme:
-    len(folderIds) == exact_vip_count (Zero Extra Crowd/Guests)
+    Returns (filtered_candidates, is_pure_vip_only)
     """
-    clean_candidates = []
+    strict_candidates = []
 
     for key in candidate_keys:
         link_doc = WebLinks.objects(originalKey=key).first() or WebLinks.objects(thumbnailKey=key).first()
         if link_doc and link_doc.folderIds:
+            # Check if tagged folders exactly match VIP count
             if len(link_doc.folderIds) == exact_vip_count:
-                clean_candidates.append(key)
+                strict_candidates.append(key)
 
-    return clean_candidates if clean_candidates else candidate_keys
-
+    if strict_candidates:
+        return strict_candidates, True  # Pure VIP candidates found!
+    
+    return candidate_keys, False  # Fallback to candidates with possible crowd
 
 
 
