@@ -617,16 +617,19 @@ def generate_and_save_folder_banner(folderId: str) -> dict:
             if not selected_banner_key and vip_count >= 3:
                 top_2_common = set.intersection(main_persons_image_sets[0], main_persons_image_sets[1])
                 if top_2_common:
-                    clean_candidates = filter_strict_vip_photos(list(top_2_common), exact_vip_count=2)
+                    # 🛠️ CHANGE 1: Tuple unpacking added (clean_candidates, _)
+                    clean_candidates, _ = filter_strict_vip_photos(list(top_2_common), exact_vip_count=2)
                     selected_banner_key = get_best_banner_image(clean_candidates, expected_vip_count=2)
 
             if not selected_banner_key:
                 union_all = set.union(*main_persons_image_sets)
-                clean_candidates = filter_strict_vip_photos(list(union_all), exact_vip_count=vip_count)
+                # 🛠️ CHANGE 2: Tuple unpacking added (clean_candidates, _)
+                clean_candidates, _ = filter_strict_vip_photos(list(union_all), exact_vip_count=vip_count)
                 selected_banner_key = get_best_banner_image(clean_candidates, expected_vip_count=vip_count)
 
         elif vip_count == 1:
-            clean_candidates = filter_strict_vip_photos(list(main_persons_image_sets[0]), exact_vip_count=1)
+            # 🛠️ CHANGE 3: Tuple unpacking added (clean_candidates, _)
+            clean_candidates, _ = filter_strict_vip_photos(list(main_persons_image_sets[0]), exact_vip_count=1)
             selected_banner_key = get_best_banner_image(clean_candidates, expected_vip_count=1)
         else:
             selected_banner_key = get_best_banner_image(sorted_groups[0]["images"], expected_vip_count=1)
@@ -646,7 +649,6 @@ def generate_and_save_folder_banner(folderId: str) -> dict:
     except Exception as e:
         print(f"❌ Error in generate_and_save_folder_banner: {str(e)}")
         return {"success": False, "error": str(e)}
-
 
 
 EPS = 0.6

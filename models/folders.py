@@ -104,13 +104,6 @@ class Folder(Document):
             "orderId",
             "subFolders.userId",
             "deviceTracking.userId",
-            {
-                "fields": ["customerId", "eventId"],
-                "unique": True,
-                "partialFilterExpression": {
-                    "eventId": {"$exists": True}
-                }
-            }
         ]
     }
     
