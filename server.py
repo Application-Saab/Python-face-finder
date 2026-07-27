@@ -37,6 +37,8 @@ from fastapi import Form, HTTPException
 from eventFaceFinder import router as event_router
 import gc 
 from datetime import datetime
+import requests
+import io
 
 
 
@@ -639,10 +641,6 @@ def generate_and_save_folder_banner(folderId: str) -> dict:
                 banner_url = banner_doc.thumbnailImageUrl or banner_doc.originalUrl
 
         if banner_url:
-            folder_doc.bannerImageUrl = banner_url
-            folder_doc.updatedAt = datetime.utcnow()
-            folder_doc.save()
-            print(f"✅ DB Update Successful: bannerImageUrl set to {banner_url}")
             return {"success": True, "bannerUrl": banner_url, "selectedKey": selected_banner_key}
         
         return {"success": False, "message": "Banner key found but URL missing"}
@@ -702,7 +700,6 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                 faces = searcher.app.get(img)
                 if not faces:
                     continue
-
 
                 for face in faces:
                     det_score = getattr(face, 'det_score', 1.0)
@@ -843,13 +840,50 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
         banner_result = generate_and_save_folder_banner(folderId=folderId)
         
         if banner_result.get("success"):
-            print(f"🎉 Banner automatically assigned: {banner_result.get('bannerUrl')}")
+            banner_url = banner_result.get("bannerUrl")
+            print(f"🎉 Banner automatically assigned: {banner_url}")
+
+            # 2. NodeJS API Endpoint
+            NODE_API_URL = "http://localhost:9000/api/internal/generate-banner"  # Node Express URL
+
+            try:
+                # A. Download Image File Bytes into Memory
+                img_response = requests.get(banner_url, timeout=10)
+                img_response.raise_for_status()
+        
+                # Memory Bytes Buffer
+                image_bytes = io.BytesIO(img_response.content)
+
+                # B. FormData text fields
+                payload = {
+                    "folderId": str(folderId),
+                }
+
+                # C. File Payload (Multipart Form-Data)
+                files = {
+                    "leftImage": ("left_image.jpg", image_bytes, "image/jpeg")
+                }
+
+                # D. Express Node.js API Request Trigger
+                response = requests.post(NODE_API_URL, data=payload, files=files, timeout=30)
+                res_data = response.json()
+
+                if response.status_code == 200 and res_data.get("success"):
+                    print(f"✅ Node.js Canvas Banner Generated & Saved: {res_data.get('bannerUrl')}")
+                else:
+                    print(f"❌ Node.js API Error: {res_data.get('error') or res_data.get('message')}")
+
+                # Memory Clean
+                image_bytes.close()
+
+            except Exception as req_err:
+                print(f"❌ Error while calling Node.js Banner API: {str(req_err)}")
+
         else:
-            print(f"⚠️ Banner generation failed or skipped: {banner_result.get('message')}")
+            print("❌ Banner generation failed in Python layer.")
 
     except Exception as e:
         print(f"❌ Error in background face recognition: {str(e)}")
-
 @app.post("/count-unique-persons")
 async def count_unique_persons(
     background_tasks: BackgroundTasks,
