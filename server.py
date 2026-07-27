@@ -41,7 +41,6 @@ import requests
 import io
 
 
-
 s3_client = boto3.client('s3') 
 BUCKET_NAME = "photography-hora"
 AWS_REGION = os.getenv("AWS_REGION", "eu-north-1")
@@ -613,7 +612,7 @@ def generate_and_save_folder_banner(folderId: str) -> dict:
         if vip_count > 1:
             common_all = set.intersection(*main_persons_image_sets)
             if common_all:
-                clean_candidates = filter_strict_vip_photos(list(common_all), exact_vip_count=vip_count)
+                clean_candidates, _ = filter_strict_vip_photos(list(common_all), exact_vip_count=vip_count)
                 selected_banner_key = get_best_banner_image(clean_candidates, expected_vip_count=vip_count)
 
             if not selected_banner_key and vip_count >= 3:
@@ -843,47 +842,53 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
             banner_url = banner_result.get("bannerUrl")
             print(f"🎉 Banner automatically assigned: {banner_url}")
 
-            # 2. NodeJS API Endpoint
-            NODE_API_URL = "http://localhost:9000/api/internal/generate-banner"  # Node Express URL
+            folder_doc = Folder.objects(id=folderId).first()
+            event_id = getattr(folder_doc, "eventId", None) if folder_doc else None
+            
+            # Check if eventId exists and is valid (not None, null, or empty string)
+            if event_id and str(event_id).strip():
+                print(f"✅ eventId found ('{event_id}'). Calling Node.js Canvas API...")
 
-            try:
-                # A. Download Image File Bytes into Memory
-                img_response = requests.get(banner_url, timeout=10)
-                img_response.raise_for_status()
-        
-                # Memory Bytes Buffer
-                image_bytes = io.BytesIO(img_response.content)
+                # 2. NodeJS API Endpoint
+                NODE_API_URL = "https://horaservices.com/api/internal/generate-banner" 
 
-                # B. FormData text fields
-                payload = {
-                    "folderId": str(folderId),
-                }
+                try:
+                    img_response = requests.get(banner_url, timeout=10)
+                    img_response.raise_for_status()
+            
+                    image_bytes = io.BytesIO(img_response.content)
 
-                # C. File Payload (Multipart Form-Data)
-                files = {
-                    "leftImage": ("left_image.jpg", image_bytes, "image/jpeg")
-                }
+                    payload = {
+                        "folderId": str(folderId),
+                    }
 
-                # D. Express Node.js API Request Trigger
-                response = requests.post(NODE_API_URL, data=payload, files=files, timeout=30)
-                res_data = response.json()
+                    files = {
+                        "leftImage": ("left_image.jpg", image_bytes, "image/jpeg")
+                    }
 
-                if response.status_code == 200 and res_data.get("success"):
-                    print(f"✅ Node.js Canvas Banner Generated & Saved: {res_data.get('bannerUrl')}")
-                else:
-                    print(f"❌ Node.js API Error: {res_data.get('error') or res_data.get('message')}")
+                    response = requests.post(NODE_API_URL, data=payload, files=files, timeout=30)
+                    res_data = response.json()
 
-                # Memory Clean
-                image_bytes.close()
+                    if response.status_code == 200 and res_data.get("success"):
+                        print(f"✅ Node.js Canvas Banner Generated & Saved: {res_data.get('bannerUrl')}")
+                    else:
+                        print(f"❌ Node.js API Error: {res_data.get('error') or res_data.get('message')}")
 
-            except Exception as req_err:
-                print(f"❌ Error while calling Node.js Banner API: {str(req_err)}")
+                    image_bytes.close()
+
+                except Exception as req_err:
+                    print(f"❌ Error while calling Node.js Banner API: {str(req_err)}")
+
+            else:
+                print(f"⚠️ eventId is missing or null for Folder ID {folderId}. Skipping Node.js API call.")
 
         else:
             print("❌ Banner generation failed in Python layer.")
 
     except Exception as e:
         print(f"❌ Error in background face recognition: {str(e)}")
+
+
 @app.post("/count-unique-persons")
 async def count_unique_persons(
     background_tasks: BackgroundTasks,
@@ -914,6 +919,92 @@ async def count_unique_persons(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.post("/api/test/generate-banner/{folder_id}")
+async def test_generate_banner_endpoint(folder_id: str):
+    """Directly triggers banner scoring logic & Node.js API call only if eventId exists in the folder."""
+    try:
+        print("\n==================================================")
+        print(f"🧪 TEST API HIT: Generating Banner for Folder {folder_id}")
+        print("==================================================\n")
+
+        folder_doc = Folder.objects(id=folder_id).first()
+
+        if not folder_doc:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Folder not found with id: {folder_id}",
+            )
+
+        banner_result = generate_and_save_folder_banner(folderId=folder_id)
+
+        if not banner_result.get("success"):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "Fail banner selection",
+                    "details": banner_result,
+                },
+            )
+
+        banner_url = banner_result.get("bannerUrl")
+        selected_key = banner_result.get("selectedKey")
+
+        event_id = getattr(folder_doc, "eventId", None)
+        node_res_data = None
+        node_api_called = False
+
+        if event_id and str(event_id).strip():
+            print(
+                f"✅ Valid eventId found ('{event_id}'). Triggering Node.js API..."
+            )
+
+            NODE_API_URL = "https://horaservices.com/api/internal/generate-banner"
+
+            img_response = requests.get(banner_url, timeout=10)
+            img_response.raise_for_status()
+
+            image_bytes = io.BytesIO(img_response.content)
+
+            payload = {"folderId": str(folder_id), "eventId": str(event_id)}
+            files = {"leftImage": ("left_image.jpg", image_bytes, "image/jpeg")}
+
+            node_response = requests.post(
+                NODE_API_URL, data=payload, files=files, timeout=30
+            )
+            node_res_data = node_response.json()
+
+            image_bytes.close()
+            node_api_called = True
+        else:
+            print(
+                f"⚠️ eventId missing or null for Folder ID {folder_id}. Node.js API call skipped."
+            )
+
+        return {
+            "success": True,
+            "message": (
+                "Banner generated and pushed to Node.js successfully!"
+                if node_api_called
+                else "Banner selected in Python, but Node.js API skipped because eventId does not exist."
+            ),
+            "data": {
+                "folderId": folder_id,
+                "eventId": event_id,
+                "selectedKey": selected_key,
+                "bannerUrl": banner_url,
+                "nodeApiCalled": node_api_called,
+                "nodeApiResponse": node_res_data,
+            },
+        }
+
+    except HTTPException as http_ex:
+        raise http_ex
+    except Exception as e:
+        print(f"❌ Error in test_generate_banner_endpoint: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    
 # Serve index.html at root
 @app.get("/", response_class=HTMLResponse)
 async def serve_index():
