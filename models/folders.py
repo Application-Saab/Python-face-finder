@@ -124,8 +124,6 @@ class Folder(Document):
         required=True
     )
 
-    bannerImageUrl = StringField()
-
     viewedBy = DynamicField()
 
     clickCount = IntField(

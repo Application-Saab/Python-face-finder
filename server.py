@@ -377,7 +377,6 @@ async def search_faces_s3(
     )
 
 
-# OpenCV Haar Cascade Frontal Face Detector Load Karo
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
 
@@ -411,7 +410,7 @@ def get_best_banner_image(image_keys: list, expected_vip_count: int) -> str:
         for key in batch_candidates:
             try:
                 # ---------------------------------------------------------
-                # ⚡ 1. WEBP / THUMBNAIL KEY FETCH (RAM OPTIMIZATION)
+                #  1. WEBP / THUMBNAIL KEY FETCH (RAM OPTIMIZATION)
                 # ---------------------------------------------------------
                 link_doc = WebLinks.objects(originalKey=key).first() or WebLinks.objects(thumbnailKey=key).first()
                 
@@ -431,7 +430,7 @@ def get_best_banner_image(image_keys: list, expected_vip_count: int) -> str:
                 height, width, _ = img.shape
                 
                 # ---------------------------------------------------------
-                # 📐 2. ASPECT RATIO & LANDSCAPE FILTER (UI INTEGRITY)
+                # 2. ASPECT RATIO & LANDSCAPE FILTER (UI INTEGRITY)
                 # ---------------------------------------------------------
                 aspect_ratio = width / float(height)
 
@@ -449,7 +448,7 @@ def get_best_banner_image(image_keys: list, expected_vip_count: int) -> str:
                 megapixels = (width * height) / 1000000.0
 
                 # ---------------------------------------------------------
-                # 👤 3. FRONT FACE DETECTION (OpenCV)
+                # 3. FRONT FACE DETECTION (OpenCV)
                 # ---------------------------------------------------------
                 faces = face_cascade.detectMultiScale(
                     gray, 
@@ -460,7 +459,7 @@ def get_best_banner_image(image_keys: list, expected_vip_count: int) -> str:
                 detected_faces_count = len(faces)
 
                 # ---------------------------------------------------------
-                # 🎯 4. SCORING FORMULA WITH STRICT CROWD PENALTY
+                # 4. SCORING FORMULA WITH STRICT CROWD PENALTY
                 # ---------------------------------------------------------
                 if detected_faces_count == expected_vip_count:
                     # PERFECT MATCH: Exact number of detected faces matches VIP count
@@ -495,7 +494,7 @@ def get_best_banner_image(image_keys: list, expected_vip_count: int) -> str:
                 continue
 
         # ---------------------------------------------------------
-        # ⚡ 5. EXPLICIT GARBAGE COLLECTION PER BATCH
+        # 5. EXPLICIT GARBAGE COLLECTION PER BATCH
         # ---------------------------------------------------------
         gc.collect()
 
