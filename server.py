@@ -35,6 +35,21 @@ load_dotenv()
 from fastapi import BackgroundTasks
 
 from eventFaceFinder import router as event_router
+import warnings
+import cv2
+import numpy as np
+from PIL import Image
+from fastapi import FastAPI, BackgroundTasks, Form, HTTPException
+import mediapipe as mp
+
+
+
+
+# ---------------------------------------------------------
+# 0. HIDE UNWANTED LIBRARY WARNINGS (Numpy/InsightFace Noise)
+# ---------------------------------------------------------
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
 
 
 
@@ -579,6 +594,795 @@ async def count_unique_persons(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+
+
+
+
+# # =========================================================
+# # 0. MEDIAPIPE FACE MESH SETUP
+# # =========================================================
+# mp_face_mesh = mp.solutions.face_mesh
+# _face_mesh_detector = mp_face_mesh.FaceMesh(
+#     static_image_mode=True,
+#     max_num_faces=1,
+#     refine_landmarks=True,
+#     min_detection_confidence=0.5,
+# )
+
+# # ---- Eye landmark indices (EAR) ----
+# LEFT_EYE_EAR_IDX = [33, 160, 158, 133, 153, 144]
+# RIGHT_EYE_EAR_IDX = [362, 385, 387, 263, 373, 380]
+# EAR_CLOSED_THRESHOLD = 0.21
+
+# # ---- Mouth landmark indices (MAR + smile curve) ----
+# MOUTH_LEFT_CORNER = 61
+# MOUTH_RIGHT_CORNER = 291
+# MOUTH_UPPER_CENTER = 13
+# MOUTH_LOWER_CENTER = 14
+
+# # Mouth-open ratio (talking/yawning vs closed-mouth smile)
+# MAR_OPEN_THRESHOLD = 0.40
+
+# # Lip-corner-curve thresholds (corners raised relative to mouth midline,
+# # normalized by mouth width). Positive = corners curving upward = smile.
+# SMILE_CURVE_STRONG = 0.06
+# SMILE_CURVE_MILD = 0.02
+
+
+# def _euclidean(p1, p2):
+#     return np.linalg.norm(np.array(p1) - np.array(p2))
+
+
+# # =========================================================
+# # 1. SINGLE FACE-MESH PASS (shared by eye + smile checks)
+# # =========================================================
+
+# def _get_face_mesh_landmarks(img, face):
+#     """
+#     Crops the face region once, runs MediaPipe Face Mesh once, and returns
+#     (landmarks, crop_w, crop_h) so both eye and mouth checks can reuse the
+#     same detection instead of running the mesh model twice per face.
+#     Returns None if landmarks couldn't be found.
+#     """
+#     try:
+#         h_img, w_img = img.shape[:2]
+#         x1, y1, x2, y2 = map(int, face.bbox)
+#         x1, y1 = max(0, x1), max(0, y1)
+#         x2, y2 = min(w_img, x2), min(h_img, y2)
+
+#         pad_x = int((x2 - x1) * 0.25)
+#         pad_y = int((y2 - y1) * 0.35)
+#         cx1, cy1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
+#         cx2, cy2 = min(w_img, x2 + pad_x), min(h_img, y2 + pad_y)
+
+#         face_crop = img[cy1:cy2, cx1:cx2]
+#         if face_crop.size == 0 or face_crop.shape[0] < 20 or face_crop.shape[1] < 20:
+#             return None
+
+#         rgb_crop = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
+#         result = _face_mesh_detector.process(rgb_crop)
+
+#         if not result.multi_face_landmarks:
+#             return None
+
+#         crop_h, crop_w = face_crop.shape[:2]
+#         return result.multi_face_landmarks[0].landmark, crop_w, crop_h
+
+#     except Exception as e:
+#         print(f"[LOG] Face Mesh Extraction Exception: {e}")
+#         return None
+
+
+# # =========================================================
+# # 2. ACCURATE EYE BLINK & OPEN CHECK (EAR-based)
+# # =========================================================
+
+# def _compute_ear(landmarks, idxs, w, h):
+#     pts = [(landmarks[i].x * w, landmarks[i].y * h) for i in idxs]
+#     p1, p2, p3, p4, p5, p6 = pts
+#     vertical_1 = _euclidean(p2, p6)
+#     vertical_2 = _euclidean(p3, p5)
+#     horizontal = _euclidean(p1, p4)
+#     if horizontal == 0:
+#         return None
+#     return (vertical_1 + vertical_2) / (2.0 * horizontal)
+
+
+# def check_eye_open(mesh_data):
+#     """
+#     Eyes Open/Closed via Eye Aspect Ratio (EAR).
+#     mesh_data = (landmarks, crop_w, crop_h) from _get_face_mesh_landmarks, or None.
+#     Returns True (Open) as a safe fallback when landmarks are unavailable.
+#     """
+#     if mesh_data is None:
+#         return True
+
+#     landmarks, crop_w, crop_h = mesh_data
+#     try:
+#         left_ear = _compute_ear(landmarks, LEFT_EYE_EAR_IDX, crop_w, crop_h)
+#         right_ear = _compute_ear(landmarks, RIGHT_EYE_EAR_IDX, crop_w, crop_h)
+#         valid_ears = [e for e in (left_ear, right_ear) if e is not None]
+#         if not valid_ears:
+#             return True
+#         avg_ear = sum(valid_ears) / len(valid_ears)
+#         return avg_ear >= EAR_CLOSED_THRESHOLD
+#     except Exception as e:
+#         print(f"[LOG] EAR Computation Exception: {e}")
+#         return True
+
+
+# # =========================================================
+# # 3. ANGLE-ROBUST SMILE CHECK (MAR + lip-corner curve)
+# # =========================================================
+
+# def check_smile(mesh_data):
+#     """
+#     Detects smile using two signals instead of raw mouth width (which
+#     shrinks under face rotation and gives false negatives on turned faces):
+
+#     1. MAR (Mouth Aspect Ratio) = mouth_height / mouth_width
+#        -> tells us if the mouth is open (talking/laughing/yawning)
+#     2. Lip-corner curve = how much the mouth corners lift above the
+#        upper/lower-lip midline, normalized by mouth width
+#        -> tells us if the mouth shape is curving into a smile,
+#           independent of head yaw (both corners and midline shift
+#           together under rotation, so the *relative* curve is stable)
+
+#     Returns (score, label).
+#     """
+#     if mesh_data is None:
+#         return 10, "Neutral Expression (+10) [mesh unavailable]"
+
+#     landmarks, crop_w, crop_h = mesh_data
+#     try:
+#         left_corner = (landmarks[MOUTH_LEFT_CORNER].x * crop_w, landmarks[MOUTH_LEFT_CORNER].y * crop_h)
+#         right_corner = (landmarks[MOUTH_RIGHT_CORNER].x * crop_w, landmarks[MOUTH_RIGHT_CORNER].y * crop_h)
+#         upper_center = (landmarks[MOUTH_UPPER_CENTER].x * crop_w, landmarks[MOUTH_UPPER_CENTER].y * crop_h)
+#         lower_center = (landmarks[MOUTH_LOWER_CENTER].x * crop_w, landmarks[MOUTH_LOWER_CENTER].y * crop_h)
+
+#         mouth_width = _euclidean(left_corner, right_corner)
+#         if mouth_width == 0:
+#             return 10, "Neutral Expression (+10)"
+
+#         mouth_height = _euclidean(upper_center, lower_center)
+#         mar = mouth_height / mouth_width
+
+#         mid_y = (upper_center[1] + lower_center[1]) / 2.0
+#         corner_avg_y = (left_corner[1] + right_corner[1]) / 2.0
+#         # Image y-axis grows downward, so corners above the midline
+#         # (smaller y) => positive curve => smile
+#         curve = (mid_y - corner_avg_y) / mouth_width
+
+#         if curve >= SMILE_CURVE_STRONG:
+#             return 30, "Smile (+30)"
+#         elif curve >= SMILE_CURVE_MILD:
+#             return 20, "Slight Smile (+20)"
+#         elif mar >= MAR_OPEN_THRESHOLD:
+#             # Mouth wide open but corners not curved up -> likely talking/laughing-open, not a posed smile
+#             return 15, "Mouth Open / Talking (+15)"
+#         else:
+#             return 10, "Neutral Expression (+10)"
+
+#     except Exception as e:
+#         print(f"[LOG] Smile Computation Exception: {e}")
+#         return 10, "Neutral Expression (+10)"
+
+
+# # =========================================================
+# # 4. PURE FACE-LEVEL SCORING HELPER
+# # =========================================================
+
+# def evaluate_single_face_quality(img, face):
+#     """
+#     Evaluates metrics strictly at the FACE-LEVEL:
+#     - Face-Centric Portrait/Bokeh (Face vs Outer Rim Blur)
+#     - Eye Open / Blink Status (EAR-based)
+#     - Smile / Expression (MAR + lip-curve, angle-robust)
+#     - Pose / Yaw Angle Check (graded, candid-friendly)
+#     """
+#     f_score = 0
+#     person_logs = []
+#     h_img, w_img = img.shape[:2]
+
+#     x1, y1, x2, y2 = map(int, face.bbox)
+#     x1, y1 = max(0, x1), max(0, y1)
+#     x2, y2 = min(w_img, x2), min(h_img, y2)
+#     face_w = max(1, x2 - x1)
+
+#     # -------------------------------------------------------------
+#     # 1. FACE-LEVEL PORTRAIT / BOKEH CHECK
+#     # -------------------------------------------------------------
+#     try:
+#         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+#         face_crop = gray[y1:y2, x1:x2]
+
+#         pad = int(face_w * 0.4)
+#         rx1, ry1 = max(0, x1 - pad), max(0, y1 - pad)
+#         rx2, ry2 = min(w_img, x2 + pad), min(h_img, y2 + pad)
+#         rim_crop = gray[ry1:ry2, rx1:rx2]
+
+#         face_var = cv2.Laplacian(face_crop, cv2.CV_64F).var()
+#         rim_var = cv2.Laplacian(rim_crop, cv2.CV_64F).var()
+
+#         if face_var > 60 and rim_var < (face_var * 0.65):
+#             f_score += 20
+#             person_logs.append("Portrait Blur Effect (+20)")
+#     except Exception:
+#         pass
+
+#     # -------------------------------------------------------------
+#     # Run Face Mesh ONCE, reuse for both eye + smile checks
+#     # -------------------------------------------------------------
+#     mesh_data = _get_face_mesh_landmarks(img, face)
+
+#     # -------------------------------------------------------------
+#     # 2. EYE OPEN / BLINK CHECK
+#     # -------------------------------------------------------------
+#     is_eyes_open = check_eye_open(mesh_data)
+#     if not is_eyes_open:
+#         f_score -= 30
+#         person_logs.append("Eyes Closed/Blink (-30)")
+#     else:
+#         f_score += 30
+#         person_logs.append("Eyes Open (+30)")
+
+#     # -------------------------------------------------------------
+#     # 3. SMILE / EXPRESSION CHECK
+#     # -------------------------------------------------------------
+#     smile_score, smile_label = check_smile(mesh_data)
+#     f_score += smile_score
+#     person_logs.append(smile_label)
+
+#     # -------------------------------------------------------------
+#     # 4. POSE / YAW ANGLE CHECK (graded, candid-friendly)
+#     # -------------------------------------------------------------
+#     # Rationale: a turned head is often a genuine candid interaction
+#     # (looking at another subject, a child, a cake, etc.), not a flaw.
+#     # We only penalize once the angle is severe enough that the face
+#     # is barely usable/recognizable, and we reward front-facing more
+#     # than we used to reward a "side" pose.
+#     pose = getattr(face, 'pose', [0, 0, 0])
+#     yaw = abs(pose[1]) if len(pose) > 1 else 0
+
+#     if yaw <= 20:
+#         f_score += 20
+#         person_logs.append("Front-Facing / Engaged (+20)")
+#     elif yaw <= 45:
+#         f_score += 15
+#         person_logs.append("Natural Turn / Candid Interaction (+15)")
+#     elif yaw <= 60:
+#         f_score += 5
+#         person_logs.append("Significant Turn, Face Still Visible (+5)")
+#     else:
+#         f_score -= 10
+#         person_logs.append("Extreme Turn / Face Mostly Hidden (-10)")
+
+#     return f_score, person_logs
+
+
+# def calculate_face_level_score(img, faces):
+#     """
+#     Computes overall score purely driven by Face-level analysis across all detected faces.
+#     """
+#     if not faces:
+#         print("[LOG] Face Evaluation: No faces detected in image.")
+#         return 0, ["⚠️ No faces detected (Score: 0)"]
+
+#     total_face_score = 0
+#     face_reasons = []
+
+#     print(f"\n[LOG] --- Starting Pure Face-Level Evaluation ({len(faces)} face(s)) ---")
+
+#     for idx, face in enumerate(faces):
+#         f_score, person_logs = evaluate_single_face_quality(img, face)
+#         total_face_score += f_score
+
+#         log_summary = f"Person #{idx+1}: Score = {f_score} -> [{', '.join(person_logs)}]"
+#         face_reasons.append(log_summary)
+
+#     avg_face_score = total_face_score / len(faces)
+#     final_score = max(0, min(100, int(avg_face_score)))
+
+#     return final_score, face_reasons
+
+
+# # =========================================================
+# # 5. BACKGROUND TASK PIPELINE
+# # =========================================================
+
+# def process_masterpiece_scoring_in_background(image_keys, folderId):
+#     """
+#     Processes images strictly using Pure Face-Level Scoring.
+#     """
+#     try:
+#         print(f"\n🚀 STARTING PURE FACE-LEVEL MASTERPIECE SCORING FOR {len(image_keys)} IMAGES")
+
+#         for key in image_keys:
+#             try:
+#                 filename = key.split("/")[-1]
+#                 print("\n" + "-" * 60)
+#                 print(f"🖼️ ANALYZING IMAGE: {filename}")
+
+#                 img = read_s3_image(key)
+#                 if img is None:
+#                     print(f"❌ Failed to read image from S3: {key}")
+#                     continue
+
+#                 if not isinstance(img, np.ndarray):
+#                     img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+#                 faces = searcher.app.get(img)
+#                 valid_faces = [f for f in faces if getattr(f, 'det_score', 1.0) >= 0.65]
+
+#                 final_score, face_logs = calculate_face_level_score(img, valid_faces)
+
+#                 print(f"  📌 Face Level Checks ({len(valid_faces)} Valid Face(s) Found):")
+#                 for log in face_logs:
+#                     print(f"     • {log}")
+
+#                 WebLinks.objects(thumbnailKey__endswith=filename).update_one(
+#                     set__masterpieceScore=final_score,
+#                     set__isProcessedForStory=True
+#                 )
+
+#                 print(f"🎯 FINAL FACE-LEVEL SCORE SAVED TO DB: {final_score}/100")
+
+#             except Exception as img_err:
+#                 print(f"⚠️ Error scoring image {key}: {str(img_err)}")
+
+#         print("\n" + "=" * 60)
+#         print("✅ ALL FACE-LEVEL MASTERPIECE SCORING COMPLETED SUCCESSFULLY")
+
+#     except Exception as e:
+#         print(f"❌ Error in background task execution: {str(e)}")
+
+
+# # =========================================================
+# # 6. FASTAPI ROUTE
+# # =========================================================
+
+# @app.post("/generate-masterpiece-scores")
+# async def generate_masterpiece_scores(
+#     background_tasks: BackgroundTasks,
+#     folder_name: str = Form(...),
+#     folderId: str = Form(...)
+# ):
+#     try:
+#         image_keys = list_s3_images(folder_name)
+
+#         if not image_keys:
+#             return {"success": False, "message": "No images found in S3 path"}
+
+#         background_tasks.add_task(
+#             process_masterpiece_scoring_in_background,
+#             image_keys,
+#             folderId
+#         )
+
+#         return {
+#             "success": True,
+#             "message": "Face-level masterpiece photo scoring pipeline started successfully.",
+#             "totalImages": len(image_keys)
+#         }
+
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+
+
+
+
+import cv2
+import numpy as np
+import mediapipe as mp
+from fastapi import BackgroundTasks, Form, HTTPException
+
+# =========================================================
+# 0. MEDIAPIPE FACE MESH SETUP
+# =========================================================
+mp_face_mesh = mp.solutions.face_mesh
+_face_mesh_detector = mp_face_mesh.FaceMesh(
+    static_image_mode=True,
+    max_num_faces=1,
+    refine_landmarks=True,
+    min_detection_confidence=0.5,
+)
+
+# ---- Eye landmark indices (EAR) ----
+LEFT_EYE_EAR_IDX = [33, 160, 158, 133, 153, 144]
+RIGHT_EYE_EAR_IDX = [362, 385, 387, 263, 373, 380]
+EAR_CLOSED_THRESHOLD = 0.21
+
+# ---- Mouth landmark indices (MAR + smile curve) ----
+MOUTH_LEFT_CORNER = 61
+MOUTH_RIGHT_CORNER = 291
+MOUTH_UPPER_CENTER = 13
+MOUTH_LOWER_CENTER = 14
+
+# Mouth-open ratio (talking/yawning vs closed-mouth smile)
+MAR_OPEN_THRESHOLD = 0.40
+
+# Lip-corner-curve thresholds (corners raised relative to mouth midline,
+# normalized by mouth width). Positive = corners curving upward = smile.
+SMILE_CURVE_STRONG = 0.06
+SMILE_CURVE_MILD = 0.02
+
+# ---- Scoring weights (tuned so a genuinely good photo - eyes open +
+# any expression + a normal pose - naturally clears the 70 threshold) ----
+WEIGHT_PORTRAIT_BOKEH = 10
+
+WEIGHT_EYES_OPEN = 35
+WEIGHT_EYES_CLOSED = -35
+
+WEIGHT_SMILE_STRONG = 35
+WEIGHT_SMILE_MILD = 25
+WEIGHT_MOUTH_OPEN = 20
+WEIGHT_EXPRESSION_NEUTRAL = 15
+
+WEIGHT_POSE_FRONT = 20
+WEIGHT_POSE_NATURAL_TURN = 18
+WEIGHT_POSE_SIGNIFICANT_TURN = 8
+WEIGHT_POSE_EXTREME_TURN = -10
+
+
+def _euclidean(p1, p2):
+    return np.linalg.norm(np.array(p1) - np.array(p2))
+
+
+# =========================================================
+# 1. SINGLE FACE-MESH PASS (shared by eye + smile checks)
+# =========================================================
+
+def _get_face_mesh_landmarks(img, face):
+    """
+    Crops the face region once, runs MediaPipe Face Mesh once, and returns
+    (landmarks, crop_w, crop_h) so both eye and mouth checks can reuse the
+    same detection instead of running the mesh model twice per face.
+    Returns None if landmarks couldn't be found.
+    """
+    try:
+        h_img, w_img = img.shape[:2]
+        x1, y1, x2, y2 = map(int, face.bbox)
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w_img, x2), min(h_img, y2)
+
+        pad_x = int((x2 - x1) * 0.25)
+        pad_y = int((y2 - y1) * 0.35)
+        cx1, cy1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
+        cx2, cy2 = min(w_img, x2 + pad_x), min(h_img, y2 + pad_y)
+
+        face_crop = img[cy1:cy2, cx1:cx2]
+        if face_crop.size == 0 or face_crop.shape[0] < 20 or face_crop.shape[1] < 20:
+            return None
+
+        # Pad to a square canvas. refine_landmarks=True internally expects a
+        # square ROI; a non-square crop triggers MediaPipe's
+        # "NORM_RECT without IMAGE_DIMENSIONS" warning and can skew landmark
+        # projection slightly. We pad with edge-replicated pixels rather than
+        # resizing, so we don't distort the face geometry.
+        ch, cw = face_crop.shape[:2]
+        side = max(ch, cw)
+        pad_top = (side - ch) // 2
+        pad_bottom = side - ch - pad_top
+        pad_left = (side - cw) // 2
+        pad_right = side - cw - pad_left
+        face_crop = cv2.copyMakeBorder(
+            face_crop, pad_top, pad_bottom, pad_left, pad_right,
+            borderType=cv2.BORDER_REPLICATE
+        )
+
+        rgb_crop = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
+        result = _face_mesh_detector.process(rgb_crop)
+
+        if not result.multi_face_landmarks:
+            return None
+
+        crop_h, crop_w = face_crop.shape[:2]
+        return result.multi_face_landmarks[0].landmark, crop_w, crop_h
+
+    except Exception as e:
+        print(f"[LOG] Face Mesh Extraction Exception: {e}")
+        return None
+
+
+# =========================================================
+# 2. ACCURATE EYE BLINK & OPEN CHECK (EAR-based)
+# =========================================================
+
+def _compute_ear(landmarks, idxs, w, h):
+    pts = [(landmarks[i].x * w, landmarks[i].y * h) for i in idxs]
+    p1, p2, p3, p4, p5, p6 = pts
+    vertical_1 = _euclidean(p2, p6)
+    vertical_2 = _euclidean(p3, p5)
+    horizontal = _euclidean(p1, p4)
+    if horizontal == 0:
+        return None
+    return (vertical_1 + vertical_2) / (2.0 * horizontal)
+
+
+def check_eye_open(mesh_data):
+    """
+    Eyes Open/Closed via Eye Aspect Ratio (EAR).
+    mesh_data = (landmarks, crop_w, crop_h) from _get_face_mesh_landmarks, or None.
+    Returns True (Open) as a safe fallback when landmarks are unavailable.
+    """
+    if mesh_data is None:
+        return True
+
+    landmarks, crop_w, crop_h = mesh_data
+    try:
+        left_ear = _compute_ear(landmarks, LEFT_EYE_EAR_IDX, crop_w, crop_h)
+        right_ear = _compute_ear(landmarks, RIGHT_EYE_EAR_IDX, crop_w, crop_h)
+        valid_ears = [e for e in (left_ear, right_ear) if e is not None]
+        if not valid_ears:
+            return True
+        avg_ear = sum(valid_ears) / len(valid_ears)
+        return avg_ear >= EAR_CLOSED_THRESHOLD
+    except Exception as e:
+        print(f"[LOG] EAR Computation Exception: {e}")
+        return True
+
+
+# =========================================================
+# 3. ANGLE-ROBUST SMILE CHECK (MAR + lip-corner curve)
+# =========================================================
+
+def check_smile(mesh_data):
+    """
+    Detects smile using two signals instead of raw mouth width (which
+    shrinks under face rotation and gives false negatives on turned faces):
+
+    1. MAR (Mouth Aspect Ratio) = mouth_height / mouth_width
+       -> tells us if the mouth is open (talking/laughing/yawning)
+    2. Lip-corner curve = how much the mouth corners lift above the
+       upper/lower-lip midline, normalized by mouth width
+       -> tells us if the mouth shape is curving into a smile,
+          independent of head yaw (both corners and midline shift
+          together under rotation, so the *relative* curve is stable)
+
+    Returns (score, label).
+    """
+    if mesh_data is None:
+        return WEIGHT_EXPRESSION_NEUTRAL, f"Neutral Expression (+{WEIGHT_EXPRESSION_NEUTRAL}) [mesh unavailable]"
+
+    landmarks, crop_w, crop_h = mesh_data
+    try:
+        left_corner = (landmarks[MOUTH_LEFT_CORNER].x * crop_w, landmarks[MOUTH_LEFT_CORNER].y * crop_h)
+        right_corner = (landmarks[MOUTH_RIGHT_CORNER].x * crop_w, landmarks[MOUTH_RIGHT_CORNER].y * crop_h)
+        upper_center = (landmarks[MOUTH_UPPER_CENTER].x * crop_w, landmarks[MOUTH_UPPER_CENTER].y * crop_h)
+        lower_center = (landmarks[MOUTH_LOWER_CENTER].x * crop_w, landmarks[MOUTH_LOWER_CENTER].y * crop_h)
+
+        mouth_width = _euclidean(left_corner, right_corner)
+        if mouth_width == 0:
+            return WEIGHT_EXPRESSION_NEUTRAL, f"Neutral Expression (+{WEIGHT_EXPRESSION_NEUTRAL})"
+
+        mouth_height = _euclidean(upper_center, lower_center)
+        mar = mouth_height / mouth_width
+
+        mid_y = (upper_center[1] + lower_center[1]) / 2.0
+        corner_avg_y = (left_corner[1] + right_corner[1]) / 2.0
+        # Image y-axis grows downward, so corners above the midline
+        # (smaller y) => positive curve => smile
+        curve = (mid_y - corner_avg_y) / mouth_width
+
+        if curve >= SMILE_CURVE_STRONG:
+            return WEIGHT_SMILE_STRONG, f"Smile (+{WEIGHT_SMILE_STRONG})"
+        elif curve >= SMILE_CURVE_MILD:
+            return WEIGHT_SMILE_MILD, f"Slight Smile (+{WEIGHT_SMILE_MILD})"
+        elif mar >= MAR_OPEN_THRESHOLD:
+            # Mouth wide open but corners not curved up -> likely talking/laughing-open, not a posed smile
+            return WEIGHT_MOUTH_OPEN, f"Mouth Open / Talking (+{WEIGHT_MOUTH_OPEN})"
+        else:
+            return WEIGHT_EXPRESSION_NEUTRAL, f"Neutral Expression (+{WEIGHT_EXPRESSION_NEUTRAL})"
+
+    except Exception as e:
+        print(f"[LOG] Smile Computation Exception: {e}")
+        return WEIGHT_EXPRESSION_NEUTRAL, f"Neutral Expression (+{WEIGHT_EXPRESSION_NEUTRAL})"
+
+
+# =========================================================
+# 4. PURE FACE-LEVEL SCORING HELPER
+# =========================================================
+
+def evaluate_single_face_quality(img, face):
+    """
+    Evaluates metrics strictly at the FACE-LEVEL:
+    - Face-Centric Portrait/Bokeh (Face vs Outer Rim Blur)
+    - Eye Open / Blink Status (EAR-based)
+    - Smile / Expression (MAR + lip-curve, angle-robust)
+    - Pose / Yaw Angle Check (graded, candid-friendly)
+    """
+    f_score = 0
+    person_logs = []
+    h_img, w_img = img.shape[:2]
+
+    x1, y1, x2, y2 = map(int, face.bbox)
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w_img, x2), min(h_img, y2)
+    face_w = max(1, x2 - x1)
+
+    # -------------------------------------------------------------
+    # 1. FACE-LEVEL PORTRAIT / BOKEH CHECK
+    # -------------------------------------------------------------
+    try:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        face_crop = gray[y1:y2, x1:x2]
+
+        pad = int(face_w * 0.4)
+        rx1, ry1 = max(0, x1 - pad), max(0, y1 - pad)
+        rx2, ry2 = min(w_img, x2 + pad), min(h_img, y2 + pad)
+        rim_crop = gray[ry1:ry2, rx1:rx2]
+
+        face_var = cv2.Laplacian(face_crop, cv2.CV_64F).var()
+        rim_var = cv2.Laplacian(rim_crop, cv2.CV_64F).var()
+
+        if face_var > 60 and rim_var < (face_var * 0.65):
+            f_score += WEIGHT_PORTRAIT_BOKEH
+            person_logs.append(f"Portrait Blur Effect (+{WEIGHT_PORTRAIT_BOKEH})")
+    except Exception:
+        pass
+
+    # -------------------------------------------------------------
+    # Run Face Mesh ONCE, reuse for both eye + smile checks
+    # -------------------------------------------------------------
+    mesh_data = _get_face_mesh_landmarks(img, face)
+
+    # -------------------------------------------------------------
+    # 2. EYE OPEN / BLINK CHECK
+    # -------------------------------------------------------------
+    is_eyes_open = check_eye_open(mesh_data)
+    if not is_eyes_open:
+        f_score += WEIGHT_EYES_CLOSED
+        person_logs.append(f"Eyes Closed/Blink ({WEIGHT_EYES_CLOSED})")
+    else:
+        f_score += WEIGHT_EYES_OPEN
+        person_logs.append(f"Eyes Open (+{WEIGHT_EYES_OPEN})")
+
+    # -------------------------------------------------------------
+    # 3. SMILE / EXPRESSION CHECK
+    # -------------------------------------------------------------
+    smile_score, smile_label = check_smile(mesh_data)
+    f_score += smile_score
+    person_logs.append(smile_label)
+
+    # -------------------------------------------------------------
+    # 4. POSE / YAW ANGLE CHECK (graded, candid-friendly)
+    # -------------------------------------------------------------
+    pose = getattr(face, 'pose', [0, 0, 0])
+    yaw = abs(pose[1]) if len(pose) > 1 else 0
+
+    if yaw <= 20:
+        f_score += WEIGHT_POSE_FRONT
+        person_logs.append(f"Front-Facing / Engaged (+{WEIGHT_POSE_FRONT})")
+    elif yaw <= 45:
+        f_score += WEIGHT_POSE_NATURAL_TURN
+        person_logs.append(f"Natural Turn / Candid Interaction (+{WEIGHT_POSE_NATURAL_TURN})")
+    elif yaw <= 60:
+        f_score += WEIGHT_POSE_SIGNIFICANT_TURN
+        person_logs.append(f"Significant Turn, Face Still Visible (+{WEIGHT_POSE_SIGNIFICANT_TURN})")
+    else:
+        f_score += WEIGHT_POSE_EXTREME_TURN
+        person_logs.append(f"Extreme Turn / Face Mostly Hidden ({WEIGHT_POSE_EXTREME_TURN})")
+
+    return f_score, person_logs
+
+
+def calculate_face_level_score(img, faces):
+    """
+    Computes overall score purely driven by Face-level analysis across all detected faces.
+    """
+    if not faces:
+        print("[LOG] Face Evaluation: No faces detected in image.")
+        return 0, ["⚠️ No faces detected (Score: 0)"]
+
+    total_face_score = 0
+    face_reasons = []
+
+    print(f"\n[LOG] --- Starting Pure Face-Level Evaluation ({len(faces)} face(s)) ---")
+
+    for idx, face in enumerate(faces):
+        f_score, person_logs = evaluate_single_face_quality(img, face)
+        total_face_score += f_score
+
+        log_summary = f"Person #{idx+1}: Score = {f_score} -> [{', '.join(person_logs)}]"
+        face_reasons.append(log_summary)
+
+    avg_face_score = total_face_score / len(faces)
+    final_score = max(0, min(100, round(avg_face_score)))
+
+    return final_score, face_reasons
+
+
+# =========================================================
+# 5. BACKGROUND TASK PIPELINE
+# =========================================================
+
+def process_masterpiece_scoring_in_background(image_keys, folderId):
+    """
+    Processes images strictly using Pure Face-Level Scoring.
+    """
+    try:
+        print(f"\n🚀 STARTING PURE FACE-LEVEL MASTERPIECE SCORING FOR {len(image_keys)} IMAGES")
+
+        for key in image_keys:
+            try:
+                filename = key.split("/")[-1]
+                print("\n" + "-" * 60)
+                print(f"🖼️ ANALYZING IMAGE: {filename}")
+
+                img = read_s3_image(key)
+                if img is None:
+                    print(f"❌ Failed to read image from S3: {key}")
+                    continue
+
+                if not isinstance(img, np.ndarray):
+                    img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+                faces = searcher.app.get(img)
+                valid_faces = [f for f in faces if getattr(f, 'det_score', 1.0) >= 0.65]
+
+                final_score, face_logs = calculate_face_level_score(img, valid_faces)
+
+                print(f"  📌 Face Level Checks ({len(valid_faces)} Valid Face(s) Found):")
+                for log in face_logs:
+                    print(f"     • {log}")
+
+                WebLinks.objects(thumbnailKey__endswith=filename).update_one(
+                    set__masterpieceScore=final_score,
+                    set__isProcessedForStory=True
+                )
+
+                print(f"🎯 FINAL FACE-LEVEL SCORE SAVED TO DB: {final_score}/100")
+
+            except Exception as img_err:
+                print(f"⚠️ Error scoring image {key}: {str(img_err)}")
+
+        print("\n" + "=" * 60)
+        print("✅ ALL FACE-LEVEL MASTERPIECE SCORING COMPLETED SUCCESSFULLY")
+
+    except Exception as e:
+        print(f"❌ Error in background task execution: {str(e)}")
+
+
+# =========================================================
+# 6. FASTAPI ROUTE
+# =========================================================
+
+@app.post("/generate-masterpiece-scores")
+async def generate_masterpiece_scores(
+    background_tasks: BackgroundTasks,
+    folder_name: str = Form(...),
+    folderId: str = Form(...)
+):
+    try:
+        image_keys = list_s3_images(folder_name)
+
+        if not image_keys:
+            return {"success": False, "message": "No images found in S3 path"}
+
+        background_tasks.add_task(
+            process_masterpiece_scoring_in_background,
+            image_keys,
+            folderId
+        )
+
+        return {
+            "success": True,
+            "message": "Face-level masterpiece photo scoring pipeline started successfully.",
+            "totalImages": len(image_keys)
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 
 # Serve index.html at root
 @app.get("/", response_class=HTMLResponse)

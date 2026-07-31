@@ -3,7 +3,8 @@ from mongoengine import (
     StringField,
     ListField,
     DateTimeField,
-    IntField
+    IntField,
+    BooleanField
 )
 from datetime import datetime
 import bson
@@ -43,6 +44,8 @@ class WebLinks(Document):
     orderId = StringField(
         required=True
     )
+    masterpieceScore = IntField(default=0)
+    isProcessedForStory = BooleanField(default=False)
 
     fileId = StringField(
         unique=True,
