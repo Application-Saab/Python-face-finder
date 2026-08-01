@@ -675,6 +675,102 @@ def upload_face_crop(face_crop, folder_id, person_id):
     return crop_key, crop_url
 
 
+
+
+def is_side_face(face_obj):
+    try:
+        kps = face_obj.kps
+        if kps is None or len(kps) < 5:
+            return False
+
+        left_eye, right_eye, nose = kps[0], kps[1], kps[2]
+
+        dist_left = np.linalg.norm(nose - left_eye)
+        dist_right = np.linalg.norm(nose - right_eye)
+
+        if max(dist_left, dist_right) == 0:
+            return False
+
+        asymmetry_ratio = abs(dist_left - dist_right) / max(dist_left, dist_right)
+
+        # 💡 Change: 0.38 ko ghata kar 0.32 kar diya hai, taaki mild side-faces bhi pakde jayein
+        return asymmetry_ratio > 0.32
+
+    except Exception as e:
+        print(f"⚠️ is_side_face check failed: {e}")
+        return False
+
+    
+
+def cleanup_small_side_face_folders(folderId):
+    try:
+        folder_doc = Folder.objects(id=folderId).first()
+        if not folder_doc:
+            print("❌ Folder not found in cleanup")
+            return
+
+        subfolders_to_keep = []
+        removed_count = 0
+
+        for subfolder in folder_doc.subFolders:
+            if not subfolder.isPersonFolder:
+                subfolders_to_keep.append(subfolder)
+                continue
+
+            person_count = subfolder.personCount or 0
+            s3_key = getattr(subfolder.folderDp, "s3Key", None) if subfolder.folderDp else None
+
+            should_delete = False
+
+            if (person_count <= 2 or person_count == 0) and s3_key:
+                crop_img = read_s3_image(s3_key)
+                if crop_img is not None:
+                    faces = searcher.app.get(crop_img)
+                    
+                    if faces:
+                        # 1️⃣ Standard Landmark Check
+                        main_face = max(faces, key=lambda f: getattr(f, 'det_score', 0))
+                        if is_side_face(main_face):
+                            should_delete = True
+                    else:
+                        # 2️⃣ FALLBACK: Agar cropped S3 image mein direct face detect nahi hua, 
+                        # fir bhi ye single-image small folder hai, to isko delete kar do.
+                        print(f"⚠️ Face detect nahi hua (Tight S3 crop), deleting single-image folder: {s3_key}")
+                        should_delete = True
+
+            if should_delete:
+                sub_id = str(subfolder._id)
+                removed_count += 1
+
+                try:
+                    s3.delete_object(Bucket=S3_BUCKET, Key=s3_key)
+                    print(f"🗑️ S3 crop deleted: {s3_key}")
+                except Exception as s3_err:
+                    print(f"⚠️ S3 delete failed for {sub_id}: {s3_err}")
+
+                try:
+                    WebLinks.objects(folderIds=sub_id).update(pull__folderIds=sub_id)
+                except Exception as tag_err:
+                    print(f"⚠️ Untagging failed for {sub_id}: {tag_err}")
+
+                print(f"🗑️ Removed SIDE-FACE / LOW-QUALITY small folder (personCount={person_count})")
+            else:
+                subfolders_to_keep.append(subfolder)
+
+        if removed_count > 0:
+            folder_doc.subFolders = subfolders_to_keep
+            folder_doc.totalPersonCount = max(0, (folder_doc.totalPersonCount or 0) - removed_count)
+            folder_doc.save()
+            print(f"✅ Cleanup done — {removed_count} side-face/unclear small folder(s) removed")
+        else:
+            print("✅ Cleanup done — koi invalid/side-face small folder nahi mila")
+
+    except Exception as e:
+        print(f"❌ Error in cleanup_small_side_face_folders: {str(e)}")
+
+
+
+
 def process_face_clustering_in_background(image_keys, folderId, userId, folder_name):
     try:
         print(f"Total Images Found = {len(image_keys)}")
@@ -834,20 +930,20 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
         else:
             display_order_id = raw_order_id if raw_order_id else 'N/A'
 
-        print(f"🎨 Generating Best Banner Image for Folder (Order ID: {display_order_id})...")
-        
-        # Call Banner Generator Function
-        banner_result = generate_and_save_folder_banner(folderId=folderId)
-        
-        if banner_result.get("success"):
-            banner_url = banner_result.get("bannerUrl")
-            print(f"🎉 Banner automatically assigned: {banner_url}")
 
-            folder_doc = Folder.objects(id=folderId).first()
-            event_id = getattr(folder_doc, "eventId", None) if folder_doc else None
-            
-            # Check if eventId exists and is valid (not None, null, or empty string)
-            if event_id and str(event_id).strip():
+        event_id = getattr(folder_doc, "eventId", None) if folder_doc else None
+
+        if event_id and str(event_id).strip():
+
+            print(f"🎨 Generating Best Banner Image for Folder (Order ID: {display_order_id})...")
+
+            # Call Banner Generator Function
+            banner_result = generate_and_save_folder_banner(folderId=folderId)
+
+            if banner_result.get("success"):
+                banner_url = banner_result.get("bannerUrl")
+                print(f"🎉 Banner automatically assigned: {banner_url}")
+
                 print(f"✅ eventId found ('{event_id}'). Calling Node.js Canvas API...")
 
                 # 2. NodeJS API Endpoint
@@ -881,14 +977,17 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                     print(f"❌ Error while calling Node.js Banner API: {str(req_err)}")
 
             else:
-                print(f"⚠️ eventId is missing or null for Folder ID {folderId}. Skipping Node.js API call.")
+                print("❌ Banner generation failed in Python layer.")
 
         else:
-            print("❌ Banner generation failed in Python layer.")
+            print(f"⚠️ eventId is missing or null for Folder ID {folderId}. Skipping banner generation entirely.")
+
+        print("\n🧹 STARTING SIDE-FACE CLEANUP")
+        cleanup_small_side_face_folders(folderId)
+        print("✅ CLEANUP COMPLETED")
 
     except Exception as e:
         print(f"❌ Error in background face recognition: {str(e)}")
-
 
 @app.post("/count-unique-persons")
 async def count_unique_persons(
