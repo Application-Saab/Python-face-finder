@@ -679,28 +679,38 @@ def upload_face_crop(face_crop, folder_id, person_id):
 
 def is_side_face(face_obj):
     try:
-        kps = face_obj.kps
+        # 1️⃣ Agar InsightFace ne direct Pose Angle (Yaw) detect kiya hai
+        pose = getattr(face_obj, 'pose', None)
+        if pose is not None and len(pose) >= 2:
+            yaw = abs(pose[1])  # Yaw = Head rotation angle (Left/Right)
+            if yaw > 22.0:      # 22 degree se zyaada tilted face ko side face maano
+                return True
+
+        # 2️⃣ Keypoint (Landmark) Asymmetry Check
+        kps = getattr(face_obj, 'kps', None)
         if kps is None or len(kps) < 5:
-            return False
+            # Agar landmarks clearly detect nahi hue (extreme side profile)
+            return True
 
         left_eye, right_eye, nose = kps[0], kps[1], kps[2]
 
         dist_left = np.linalg.norm(nose - left_eye)
         dist_right = np.linalg.norm(nose - right_eye)
 
-        if max(dist_left, dist_right) == 0:
-            return False
+        max_dist = max(dist_left, dist_right)
+        if max_dist == 0:
+            return True
 
-        asymmetry_ratio = abs(dist_left - dist_right) / max(dist_left, dist_right)
+        asymmetry_ratio = abs(dist_left - dist_right) / max_dist
 
-        # 💡 Change: 0.38 ko ghata kar 0.32 kar diya hai, taaki mild side-faces bhi pakde jayein
-        return asymmetry_ratio > 0.32
+        # 💡 Threshold ko 0.32 se ghata kar 0.20 kar diya hai
+        # Cropped Face DPs me 20% asymmetry ka matlab clearly Profile / Side Face hai
+        return asymmetry_ratio > 0.20
 
     except Exception as e:
         print(f"⚠️ is_side_face check failed: {e}")
         return False
 
-    
 
 def cleanup_small_side_face_folders(folderId):
     try:
@@ -717,59 +727,55 @@ def cleanup_small_side_face_folders(folderId):
                 subfolders_to_keep.append(subfolder)
                 continue
 
-            person_count = subfolder.personCount or 0
-            s3_key = getattr(subfolder.folderDp, "s3Key", None) if subfolder.folderDp else None
+            sub_id = str(subfolder._id)
 
+            # ✅ Live/real-time tagged count — WebLinks DB se (source of truth)
+            actual_tagged_count = WebLinks.objects(folderIds=sub_id).count()
+
+            is_side = getattr(subfolder, "isSideFace", None)
             should_delete = False
 
-            if (person_count <= 2 or person_count == 0) and s3_key:
-                crop_img = read_s3_image(s3_key)
-                if crop_img is not None:
-                    faces = searcher.app.get(crop_img)
-                    
-                    if faces:
-                        # 1️⃣ Standard Landmark Check
-                        main_face = max(faces, key=lambda f: getattr(f, 'det_score', 0))
-                        if is_side_face(main_face):
-                            should_delete = True
-                    else:
-                        # 2️⃣ FALLBACK: Agar cropped S3 image mein direct face detect nahi hua, 
-                        # fir bhi ye single-image small folder hai, to isko delete kar do.
-                        print(f"⚠️ Face detect nahi hua (Tight S3 crop), deleting single-image folder: {s3_key}")
-                        should_delete = True
+            # 🎯 Core Requirement: isSideFace == True AND tagged count <= 2
+            if is_side is True and actual_tagged_count <= 2:
+                should_delete = True
+                print(f"🔍 SIDE-FACE (Count={actual_tagged_count}): Deleting subfolder {sub_id}")
 
+            # Final Action Block
             if should_delete:
-                sub_id = str(subfolder._id)
                 removed_count += 1
+                s3_key = getattr(subfolder.folderDp, "s3Key", None) if subfolder.folderDp else None
 
-                try:
-                    s3.delete_object(Bucket=S3_BUCKET, Key=s3_key)
-                    print(f"🗑️ S3 crop deleted: {s3_key}")
-                except Exception as s3_err:
-                    print(f"⚠️ S3 delete failed for {sub_id}: {s3_err}")
+                # 1. Delete S3 Crop Image
+                if s3_key:
+                    try:
+                        s3.delete_object(Bucket=S3_BUCKET, Key=s3_key)
+                        print(f"🗑️ S3 crop deleted: {s3_key}")
+                    except Exception as s3_err:
+                        print(f"⚠️ S3 delete failed for {sub_id}: {s3_err}")
 
+                # 2. Untag WebLinks DB
                 try:
                     WebLinks.objects(folderIds=sub_id).update(pull__folderIds=sub_id)
                 except Exception as tag_err:
                     print(f"⚠️ Untagging failed for {sub_id}: {tag_err}")
 
-                print(f"🗑️ Removed SIDE-FACE / LOW-QUALITY small folder (personCount={person_count})")
+                print(f"🗑️ SUCCESSFULLY REMOVED Side-Face Folder (ID: {sub_id}, Tagged Count: {actual_tagged_count})")
             else:
+                # Keep folder and sync real count
+                subfolder.personCount = actual_tagged_count
                 subfolders_to_keep.append(subfolder)
 
+        # Database update if any folder removed
         if removed_count > 0:
             folder_doc.subFolders = subfolders_to_keep
             folder_doc.totalPersonCount = max(0, (folder_doc.totalPersonCount or 0) - removed_count)
             folder_doc.save()
-            print(f"✅ Cleanup done — {removed_count} side-face/unclear small folder(s) removed")
+            print(f"✅ Cleanup completed — Total {removed_count} side-face folder(s) removed.")
         else:
-            print("✅ Cleanup done — koi invalid/side-face small folder nahi mila")
+            print("✅ Cleanup completed — No side-face folders with <=2 images found.")
 
     except Exception as e:
         print(f"❌ Error in cleanup_small_side_face_folders: {str(e)}")
-
-
-
 
 def process_face_clustering_in_background(image_keys, folderId, userId, folder_name):
     try:
@@ -799,29 +805,34 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
 
                 for face in faces:
                     det_score = getattr(face, 'det_score', 1.0)
-                    if det_score < 0.65: 
+                    if det_score < 0.65:
                         continue
 
                     x1, y1, x2, y2 = map(int, face.bbox)
                     face_w, face_h = x2 - x1, y2 - y1
-                    
+
                     if face_w < 35 or face_h < 35:
                         continue
 
                     pad_x, pad_y = int(face_w * 0.20), int(face_h * 0.20)
                     h, w = img.shape[:2]
-                    
+
                     crop_x1 = max(0, x1 - pad_x)
                     crop_y1 = max(0, y1 - pad_y)
                     crop_x2 = min(w, x2 + pad_x)
                     crop_y2 = min(h, y2 + pad_y)
                     face_crop = img[crop_y1:crop_y2, crop_x1:crop_x2]
 
+                    # ✅ Side-face decision yahi le lo — ORIGINAL full-image face object pe
+                    # (crop pe dobara detection karne se reliability kharab hoti hai)
+                    side_flag = is_side_face(face)
+
                     all_embeddings.append(face.embedding)
                     face_metadata.append({
                         "key": key,
                         "face_crop": face_crop.copy() if face_crop.size > 0 else img[y1:y2, x1:x2],
-                        "det_score": det_score
+                        "det_score": det_score,
+                        "is_side": side_flag
                     })
 
         if not all_embeddings:
@@ -837,7 +848,7 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
 
         cluster_groups = {}
         unknown_faces_count = 0
-        noise_id_counter = -2 
+        noise_id_counter = -2
 
         for label, metadata in zip(labels, face_metadata):
             if label == -1:
@@ -851,15 +862,18 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                 cluster_groups[current_group_id] = {
                     "images": [],
                     "best_crop": metadata["face_crop"],
-                    "max_score": metadata["det_score"]
+                    "max_score": metadata["det_score"],
+                    "best_is_side": metadata["is_side"]
                 }
-            
+
             if metadata["key"] not in cluster_groups[current_group_id]["images"]:
                 cluster_groups[current_group_id]["images"].append(metadata["key"])
-                
+
+            # Best crop (highest det_score) ke saath uska is_side flag bhi sync rakho
             if metadata["det_score"] > cluster_groups[current_group_id]["max_score"]:
                 cluster_groups[current_group_id]["best_crop"] = metadata["face_crop"]
                 cluster_groups[current_group_id]["max_score"] = metadata["det_score"]
+                cluster_groups[current_group_id]["best_is_side"] = metadata["is_side"]
 
         # =========================================================
         # STAGE 3: DB PERSISTENCE & S3 UPLOAD
@@ -868,7 +882,7 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
         if not folder_doc:
             print("❌ Folder not found in background task")
             return
-        
+
         current_ai_person_count = folder_doc.totalPersonCount or 0
         new_ai_persons_detected = len(cluster_groups)
 
@@ -885,6 +899,7 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                 userId=userId,
                 personCount=len(group_data["images"]),
                 isPersonFolder=True,
+                isSideFace=group_data["best_is_side"],   # ⬅️ NEW: stored side-face flag
                 folderDp={
                     "fileUrl": crop_url,
                     "thumbnailUrl": crop_url,
@@ -924,12 +939,11 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
         # SAFE ORDER ID EXTRACTION FOR LOGGING
         # -----------------------------------------------------
         raw_order_id = getattr(folder_doc, 'orderId', None) if 'folder_doc' in locals() and folder_doc else 'N/A'
-        
+
         if str(raw_order_id).isdigit():
             display_order_id = int(raw_order_id) + 10800
         else:
             display_order_id = raw_order_id if raw_order_id else 'N/A'
-
 
         event_id = getattr(folder_doc, "eventId", None) if folder_doc else None
 
@@ -937,7 +951,6 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
 
             print(f"🎨 Generating Best Banner Image for Folder (Order ID: {display_order_id})...")
 
-            # Call Banner Generator Function
             banner_result = generate_and_save_folder_banner(folderId=folderId)
 
             if banner_result.get("success"):
@@ -946,13 +959,12 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
 
                 print(f"✅ eventId found ('{event_id}'). Calling Node.js Canvas API...")
 
-                # 2. NodeJS API Endpoint
-                NODE_API_URL = "https://horaservices.com/api/internal/generate-banner" 
+                NODE_API_URL = "https://horaservices.com/api/internal/generate-banner"
 
                 try:
                     img_response = requests.get(banner_url, timeout=10)
                     img_response.raise_for_status()
-            
+
                     image_bytes = io.BytesIO(img_response.content)
 
                     payload = {
