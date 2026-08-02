@@ -377,11 +377,20 @@ async def search_faces_s3(
     )
 
 
+import io
+import gc
+import cv2
+import requests
+import numpy as np
+from fastapi import FastAPI, HTTPException
+
+# Assume app, Folder, WebLinks, s3_client, BUCKET_NAME pehle se imported/configured hain.
+
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
 
 # =========================================================
-# 1. OPTIMIZED: LOW-RES WEBP THUMBNAIL + BATCH PROCESSING (RAM & CPU SAFE)
+# 1. OPTIMIZED: LOW-RES WEBP THUMBNAIL + BATCH PROCESSING
 # =========================================================
 def get_best_banner_image(image_keys: list, expected_vip_count: int) -> str:
     """
@@ -389,7 +398,7 @@ def get_best_banner_image(image_keys: list, expected_vip_count: int) -> str:
     1. Low-Res WebP Thumbnail usage for RAM/CPU safety.
     2. Batch Processing (10-by-10) to avoid memory leaks.
     3. Landscape Aspect Ratio enforcement (width > height).
-    4. Exact VIP Face Count Priority (Penalizes extra crowd/guests visually detected).
+    4. Exact VIP Face Count Priority.
     """
     if not image_keys:
         return None
@@ -399,25 +408,17 @@ def get_best_banner_image(image_keys: list, expected_vip_count: int) -> str:
     best_key = image_keys[0]
     best_score = -1.0
 
-    # Test top 20 candidate images
     candidates_to_test = image_keys[:20]
     BATCH_SIZE = 10
 
-    # Process candidates in batches
     for batch_start in range(0, len(candidates_to_test), BATCH_SIZE):
         batch_candidates = candidates_to_test[batch_start : batch_start + BATCH_SIZE]
 
         for key in batch_candidates:
             try:
-                # ---------------------------------------------------------
-                #  1. WEBP / THUMBNAIL KEY FETCH (RAM OPTIMIZATION)
-                # ---------------------------------------------------------
                 link_doc = WebLinks.objects(originalKey=key).first() or WebLinks.objects(thumbnailKey=key).first()
-                
-                # Fetch light WebP thumbnailKey from S3 instead of heavy original file
                 target_s3_key = (link_doc.thumbnailKey if link_doc and link_doc.thumbnailKey else key)
 
-                # Fetch object from S3 (~100KB buffer vs ~10MB)
                 s3_obj = s3_client.get_object(Bucket=BUCKET_NAME, Key=target_s3_key)
                 img_bytes = s3_obj['Body'].read()
 
@@ -428,28 +429,16 @@ def get_best_banner_image(image_keys: list, expected_vip_count: int) -> str:
                     continue
 
                 height, width, _ = img.shape
-                
-                # ---------------------------------------------------------
-                # 2. ASPECT RATIO & LANDSCAPE FILTER (UI INTEGRITY)
-                # ---------------------------------------------------------
                 aspect_ratio = width / float(height)
 
-                # Filter out portrait or square images (Landscape required)
                 if aspect_ratio < 1.1: 
                     del img_bytes, nparr, img
                     continue
 
                 gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-                # Sharpness (Laplacian Variance)
                 sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
-
-                # Megapixels Resolution
                 megapixels = (width * height) / 1000000.0
 
-                # ---------------------------------------------------------
-                # 3. FRONT FACE DETECTION (OpenCV)
-                # ---------------------------------------------------------
                 faces = face_cascade.detectMultiScale(
                     gray, 
                     scaleFactor=1.1, 
@@ -458,72 +447,53 @@ def get_best_banner_image(image_keys: list, expected_vip_count: int) -> str:
                 )
                 detected_faces_count = len(faces)
 
-                # ---------------------------------------------------------
-                # 4. SCORING FORMULA WITH STRICT CROWD PENALTY
-                # ---------------------------------------------------------
                 if detected_faces_count == expected_vip_count:
-                    # PERFECT MATCH: Exact number of detected faces matches VIP count
                     face_score_multiplier = 2.0 
-
                 elif detected_faces_count > expected_vip_count:
-                    # CROWD PENALTY: Extra faces detected (VIPs + Crowd/Guests)
                     extra_faces = detected_faces_count - expected_vip_count
-                    # Reduces score by 30% for every extra person found in photo
                     face_score_multiplier = max(0.2, 1.0 - (extra_faces * 0.3))
-
                 else:
-                    # FEWER FACES: Less faces detected than expected VIP count
                     face_score_multiplier = 0.5 if detected_faces_count > 0 else 0.2
 
-                # Cap aspect ratio boost to 1.8x
                 aspect_ratio_multiplier = min(aspect_ratio, 1.8) 
-
-                # Final Composite Score Calculation
                 score = ((sharpness * 0.6) + (megapixels * 20.0)) * face_score_multiplier * aspect_ratio_multiplier
 
                 if score > best_score:
                     best_score = score
-                    # Store original key for DB persistence
                     best_key = key
 
-                # Per-image memory cleanup
                 del img_bytes, nparr, img, gray
 
             except Exception as e:
                 print(f"⚠️ Image score error for {key}: {str(e)}")
                 continue
 
-        # ---------------------------------------------------------
-        # 5. EXPLICIT GARBAGE COLLECTION PER BATCH
-        # ---------------------------------------------------------
         gc.collect()
 
     return best_key
 
+
 # =========================================================
-# 2. STRICT VIP-ONLY FILTER (EXACT COUNT MATCH)
+# 2. STRICT VIP-ONLY FILTER
 # =========================================================
-# Updated filter function with explicit priority logs
 def filter_strict_vip_photos(candidate_keys: list, exact_vip_count: int) -> tuple[list, bool]:
-    """
-    Returns (filtered_candidates, is_pure_vip_only)
-    """
     strict_candidates = []
 
     for key in candidate_keys:
         link_doc = WebLinks.objects(originalKey=key).first() or WebLinks.objects(thumbnailKey=key).first()
         if link_doc and link_doc.folderIds:
-            # Check if tagged folders exactly match VIP count
             if len(link_doc.folderIds) == exact_vip_count:
                 strict_candidates.append(key)
 
     if strict_candidates:
-        return strict_candidates, True  # Pure VIP candidates found!
+        return strict_candidates, True
     
-    return candidate_keys, False  # Fallback to candidates with possible crowd
+    return candidate_keys, False
 
 
-
+# =========================================================
+# 3. MAIN BANNER GENERATION FUNCTION (UPDATED GAP LOGIC)
+# =========================================================
 def generate_and_save_folder_banner(folderId: str) -> dict:
     """
     Clustering ke baad automatic run hone wala banner generator function.
@@ -541,7 +511,7 @@ def generate_and_save_folder_banner(folderId: str) -> dict:
         print("🚀 AUTOMATIC BANNER GENERATION STARTED")
         print(f"📌 Folder ID   : {folderId}")
         print(f"📂 Folder Name : {folder_name}")
-        print(f"📦 Order ID          : {int(order_id) + 10800 if str(order_id).isdigit() else order_id}")
+        print(f"📦 Order ID    : {int(order_id) + 10800 if str(order_id).isdigit() else order_id}")
         print("==================================================\n")
 
         subfolders = folder_doc.subFolders or []
@@ -584,28 +554,51 @@ def generate_and_save_folder_banner(folderId: str) -> dict:
             print("⚠️ Tagged WebLinks not found for subfolders.")
             return {"success": False, "message": "No tagged WebLinks found"}
 
-        # VIP Identification Strategy
+        # ---------------------------------------------------------
+        # 🛠️ LOGIC 2 IMPLEMENTATION: NEIGHBOR DROP-OFF (i vs i-1)
+        # ---------------------------------------------------------
         sorted_groups = sorted(person_clusters, key=lambda x: x["count"], reverse=True)
         min_photos_threshold = max(int(total_images_count * 0.10), 10)
         vip_groups = []
 
+        # Maximum 3 VIPs safety cap
+        MAX_ALLOWED_VIPS = 3
+
         for i, group in enumerate(sorted_groups):
-            count = group["count"]
-            if count < min_photos_threshold:
+            if len(vip_groups) >= MAX_ALLOWED_VIPS:
                 break
+
+            count = group["count"]
+
+            # Base minimum cutoff check
+            if count < min_photos_threshold:
+                print(f"🛑 Stopping VIP Selection: {group['folderName']} ({count} photos) is below min threshold ({min_photos_threshold}).")
+                break
+
+            # Person 1 (Highest photo count) is always VIP
             if i == 0:
                 vip_groups.append(group)
+                print(f"✅ VIP 1 Confirmed: {group['folderName']} ({count} photos)")
                 continue
-                
+
+            # Compare current Person (i) with previous Person (i-1)
             prev_count = sorted_groups[i-1]["count"]
-            if count >= (prev_count * 0.50):
+            
+            # HIGH CUT-OFF DROP-OFF CHECK:
+            # Agar agle person ki photos pichle person se 40% se zyada drop/gir jaati hain (i.e. count < 60% of prev),
+            # toh yahan achanak steep drop aagaya hai, loop yahin par STOP ho jayega.
+            if count >= (prev_count * 0.60):
                 vip_groups.append(group)
+                print(f"✅ VIP {len(vip_groups)} Confirmed: {group['folderName']} ({count} photos vs prev {prev_count})")
             else:
+                drop_percent = round(((prev_count - count) / prev_count) * 100, 1)
+                print(f"🛑 HIGH CUT-OFF DETECTED: {group['folderName']} has a steep drop of {drop_percent}% ({prev_count} -> {count}). Stopping VIP additions.")
                 break
 
         vip_count = len(vip_groups)
-        main_persons_image_sets = [set(vip["images"]) for vip in vip_groups]
+        print(f"\n🌟 FINAL VIPs SELECTED ({vip_count}): {[v['folderName'] for v in vip_groups]}\n")
 
+        main_persons_image_sets = [set(vip["images"]) for vip in vip_groups]
         selected_banner_key = None
 
         if vip_count > 1:
@@ -617,18 +610,15 @@ def generate_and_save_folder_banner(folderId: str) -> dict:
             if not selected_banner_key and vip_count >= 3:
                 top_2_common = set.intersection(main_persons_image_sets[0], main_persons_image_sets[1])
                 if top_2_common:
-                    # 🛠️ CHANGE 1: Tuple unpacking added (clean_candidates, _)
                     clean_candidates, _ = filter_strict_vip_photos(list(top_2_common), exact_vip_count=2)
                     selected_banner_key = get_best_banner_image(clean_candidates, expected_vip_count=2)
 
             if not selected_banner_key:
                 union_all = set.union(*main_persons_image_sets)
-                # 🛠️ CHANGE 2: Tuple unpacking added (clean_candidates, _)
                 clean_candidates, _ = filter_strict_vip_photos(list(union_all), exact_vip_count=vip_count)
                 selected_banner_key = get_best_banner_image(clean_candidates, expected_vip_count=vip_count)
 
         elif vip_count == 1:
-            # 🛠️ CHANGE 3: Tuple unpacking added (clean_candidates, _)
             clean_candidates, _ = filter_strict_vip_photos(list(main_persons_image_sets[0]), exact_vip_count=1)
             selected_banner_key = get_best_banner_image(clean_candidates, expected_vip_count=1)
         else:
@@ -642,6 +632,11 @@ def generate_and_save_folder_banner(folderId: str) -> dict:
                 banner_url = banner_doc.thumbnailImageUrl or banner_doc.originalUrl
 
         if banner_url:
+            print("==================================================")
+            print("🎯 BANNER GENERATED SUCCESSFULLY!")
+            print(f"🔑 Selected Banner Key : {selected_banner_key}")
+            print(f"🖼️ Banner URL          : {banner_url}")
+            print("==================================================\n")
             return {"success": True, "bannerUrl": banner_url, "selectedKey": selected_banner_key}
         
         return {"success": False, "message": "Banner key found but URL missing"}
@@ -649,6 +644,90 @@ def generate_and_save_folder_banner(folderId: str) -> dict:
     except Exception as e:
         print(f"❌ Error in generate_and_save_folder_banner: {str(e)}")
         return {"success": False, "error": str(e)}
+
+
+# =========================================================
+# 4. API ENDPOINT (FASTAPI)
+# =========================================================
+@app.post("/api/test/generate-banner/{folder_id}")
+async def test_generate_banner_endpoint(folder_id: str):
+    """Directly triggers banner scoring logic & Node.js API call only if eventId exists in the folder."""
+    try:
+        print("\n==================================================")
+        print(f"🧪 TEST API HIT: Generating Banner for Folder {folder_id}")
+        print("==================================================\n")
+
+        folder_doc = Folder.objects(id=folder_id).first()
+
+        if not folder_doc:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Folder not found with id: {folder_id}",
+            )
+
+        banner_result = generate_and_save_folder_banner(folderId=folder_id)
+
+        if not banner_result.get("success"):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "Fail banner selection",
+                    "details": banner_result,
+                },
+            )
+
+        banner_url = banner_result.get("bannerUrl")
+        selected_key = banner_result.get("selectedKey")
+
+        event_id = getattr(folder_doc, "eventId", None)
+        node_res_data = None
+        node_api_called = False
+
+        if event_id and str(event_id).strip():
+            print(f"✅ Valid eventId found ('{event_id}'). Triggering Node.js API...")
+
+            NODE_API_URL = "https://horaservices.com/api/internal/generate-banner"
+
+            img_response = requests.get(banner_url, timeout=10)
+            img_response.raise_for_status()
+
+            image_bytes = io.BytesIO(img_response.content)
+
+            payload = {"folderId": str(folder_id), "eventId": str(event_id)}
+            files = {"leftImage": ("left_image.jpg", image_bytes, "image/jpeg")}
+
+            node_response = requests.post(
+                NODE_API_URL, data=payload, files=files, timeout=30
+            )
+            node_res_data = node_response.json()
+
+            image_bytes.close()
+            node_api_called = True
+        else:
+            print(f"⚠️ eventId missing or null for Folder ID {folder_id}. Node.js API call skipped.")
+
+        return {
+            "success": True,
+            "message": (
+                "Banner generated and pushed to Node.js successfully!"
+                if node_api_called
+                else "Banner selected in Python, but Node.js API skipped because eventId does not exist."
+            ),
+            "data": {
+                "folderId": folder_id,
+                "eventId": event_id,
+                "selectedKey": selected_key,
+                "bannerUrl": banner_url,
+                "nodeApiCalled": node_api_called,
+                "nodeApiResponse": node_res_data,
+            },
+        }
+
+    except HTTPException as http_ex:
+        raise http_ex
+    except Exception as e:
+        print(f"❌ Error in test_generate_banner_endpoint: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 EPS = 0.6
@@ -921,89 +1000,6 @@ async def count_unique_persons(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/test/generate-banner/{folder_id}")
-async def test_generate_banner_endpoint(folder_id: str):
-    """Directly triggers banner scoring logic & Node.js API call only if eventId exists in the folder."""
-    try:
-        print("\n==================================================")
-        print(f"🧪 TEST API HIT: Generating Banner for Folder {folder_id}")
-        print("==================================================\n")
-
-        folder_doc = Folder.objects(id=folder_id).first()
-
-        if not folder_doc:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Folder not found with id: {folder_id}",
-            )
-
-        banner_result = generate_and_save_folder_banner(folderId=folder_id)
-
-        if not banner_result.get("success"):
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "message": "Fail banner selection",
-                    "details": banner_result,
-                },
-            )
-
-        banner_url = banner_result.get("bannerUrl")
-        selected_key = banner_result.get("selectedKey")
-
-        event_id = getattr(folder_doc, "eventId", None)
-        node_res_data = None
-        node_api_called = False
-
-        if event_id and str(event_id).strip():
-            print(
-                f"✅ Valid eventId found ('{event_id}'). Triggering Node.js API..."
-            )
-
-            NODE_API_URL = "https://horaservices.com/api/internal/generate-banner"
-
-            img_response = requests.get(banner_url, timeout=10)
-            img_response.raise_for_status()
-
-            image_bytes = io.BytesIO(img_response.content)
-
-            payload = {"folderId": str(folder_id), "eventId": str(event_id)}
-            files = {"leftImage": ("left_image.jpg", image_bytes, "image/jpeg")}
-
-            node_response = requests.post(
-                NODE_API_URL, data=payload, files=files, timeout=30
-            )
-            node_res_data = node_response.json()
-
-            image_bytes.close()
-            node_api_called = True
-        else:
-            print(
-                f"⚠️ eventId missing or null for Folder ID {folder_id}. Node.js API call skipped."
-            )
-
-        return {
-            "success": True,
-            "message": (
-                "Banner generated and pushed to Node.js successfully!"
-                if node_api_called
-                else "Banner selected in Python, but Node.js API skipped because eventId does not exist."
-            ),
-            "data": {
-                "folderId": folder_id,
-                "eventId": event_id,
-                "selectedKey": selected_key,
-                "bannerUrl": banner_url,
-                "nodeApiCalled": node_api_called,
-                "nodeApiResponse": node_res_data,
-            },
-        }
-
-    except HTTPException as http_ex:
-        raise http_ex
-    except Exception as e:
-        print(f"❌ Error in test_generate_banner_endpoint: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
 
     
 # Serve index.html at root
