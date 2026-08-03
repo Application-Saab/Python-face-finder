@@ -37,6 +37,7 @@ import gc
 from datetime import datetime
 import requests
 import bson
+from mongoengine.queryset.visitor import Q  
 
 s3_client = boto3.client('s3') 
 BUCKET_NAME = "photography-hora"
@@ -871,7 +872,7 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                 cluster_groups[current_group_id]["best_is_side"] = metadata["is_side"]
 
         # =========================================================
-        # STAGE 3: TAGGING & SIDE-FACE CLEANUP (BEFORE DB SAVE)
+        # STAGE 3: TAGGING & SIDE-FACE CLEANUP (EXACT SCHEMA MATCH)
         # =========================================================
         print("\n🚀 STARTING IMAGE TAGGING & CLEANUP PROCESS")
         valid_subfolders = []
@@ -880,20 +881,29 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
         for group_id, group_data in cluster_groups.items():
             person_id = str(uuid.uuid4())
             crop_key, crop_url = upload_face_crop(group_data["best_crop"], folderId, person_id)
-            sub_id = str(bson.ObjectId())  # String representation
+            sub_id = str(bson.ObjectId())  # String representation for subfolder ID
 
-            # 1. Tag WebLinks
-            for image_key in group_data["images"]:
-                try:
-                    filename = image_key.split("/")[-1]
-                    WebLinks.objects(thumbnailKey__endswith=filename).update(
-                        add_to_set__folderIds=sub_id
-                    )
-                except Exception as e:
-                    print(f"❌ Failed Tagging {image_key}: {str(e)}")
+            group_keys = group_data["images"]
+            group_filenames = [k.split("/")[-1] for k in group_keys if "/" in k]
 
-            # 2. Check Tagged Count
+            # 1. Bulk Tagging mapped directly to WebLinks Schema (mainFolderId, thumbnailKey, originalKey)
+            try:
+                folder_filter = Q(mainFolderId=folderId)
+                key_filter = (
+                    Q(thumbnailKey__in=group_keys) | 
+                    Q(originalKey__in=group_keys) | 
+                    Q(thumbnailKey__in=group_filenames) | 
+                    Q(originalKey__in=group_filenames)
+                )
+
+                WebLinks.objects(folder_filter & key_filter).update(add_to_set__folderIds=sub_id)
+
+            except Exception as e:
+                print(f"❌ Failed Bulk Tagging for Subfolder {sub_id}: {str(e)}")
+
+            # 2. Check Tagged Count from DB
             actual_tagged_count = WebLinks.objects(folderIds=sub_id).count()
+            print(f"📊 Subfolder {sub_id} tagged count: {actual_tagged_count}")
 
             # 3. Filter Check: Side Face + Count <= 2
             if group_data["best_is_side"] is True and actual_tagged_count <= 2:
@@ -912,9 +922,9 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                 except Exception as tag_err:
                     print(f"⚠️ Untagging failed for {sub_id}: {tag_err}")
             else:
-                # Valid Subfolder -> Append to list (Pass sub_id as string)
+                # Valid Subfolder -> Append to list
                 subfolder = SubFolder(
-                    _id=sub_id,  # ✅ FIXED: Plain string passed instead of bson.ObjectId
+                    _id=sub_id,
                     folderName="Person",
                     type="others",
                     userId=userId,
@@ -992,6 +1002,8 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
 
     except Exception as e:
         print(f"❌ Error in background face recognition: {str(e)}")
+
+
 
 @app.post("/count-unique-persons")
 async def count_unique_persons(
