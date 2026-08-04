@@ -844,44 +844,37 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
             print(f"🎉 Banner automatically assigned: {banner_url}")
 
             folder_doc = Folder.objects(id=folderId).first()
-            event_id = getattr(folder_doc, "eventId", None) if folder_doc else None
-            
-            # Check if eventId exists and is valid (not None, null, or empty string)
-            if event_id and str(event_id).strip():
-                print(f"✅ eventId found ('{event_id}'). Calling Node.js Canvas API...")
 
                 # 2. NodeJS API Endpoint
-                NODE_API_URL = "https://horaservices.com/api/internal/generate-banner" 
+            NODE_API_URL = "https://horaservices.com/api/internal/generate-banner" 
 
-                try:
-                    img_response = requests.get(banner_url, timeout=10)
-                    img_response.raise_for_status()
+            try:
+                img_response = requests.get(banner_url, timeout=10)
+                img_response.raise_for_status()
             
-                    image_bytes = io.BytesIO(img_response.content)
+                image_bytes = io.BytesIO(img_response.content)
 
-                    payload = {
-                        "folderId": str(folderId),
-                    }
+                payload = {
+                    "folderId": str(folderId),
+                }
 
-                    files = {
-                        "leftImage": ("left_image.jpg", image_bytes, "image/jpeg")
-                    }
+                files = {
+                    "leftImage": ("left_image.jpg", image_bytes, "image/jpeg")
+                }
 
-                    response = requests.post(NODE_API_URL, data=payload, files=files, timeout=30)
-                    res_data = response.json()
+                response = requests.post(NODE_API_URL, data=payload, files=files, timeout=30)
+                res_data = response.json()
 
-                    if response.status_code == 200 and res_data.get("success"):
-                        print(f"✅ Node.js Canvas Banner Generated & Saved: {res_data.get('bannerUrl')}")
-                    else:
-                        print(f"❌ Node.js API Error: {res_data.get('error') or res_data.get('message')}")
+                if response.status_code == 200 and res_data.get("success"):
+                    print(f"✅ Node.js Canvas Banner Generated & Saved: {res_data.get('bannerUrl')}")
+                else:
+                    print(f"❌ Node.js API Error: {res_data.get('error') or res_data.get('message')}")
 
-                    image_bytes.close()
+                image_bytes.close()
 
-                except Exception as req_err:
-                    print(f"❌ Error while calling Node.js Banner API: {str(req_err)}")
+            except Exception as req_err:
+                print(f"❌ Error while calling Node.js Banner API: {str(req_err)}")
 
-            else:
-                print(f"⚠️ eventId is missing or null for Folder ID {folderId}. Skipping Node.js API call.")
 
         else:
             print("❌ Banner generation failed in Python layer.")
@@ -955,32 +948,26 @@ async def test_generate_banner_endpoint(folder_id: str):
         node_res_data = None
         node_api_called = False
 
-        if event_id and str(event_id).strip():
-            print(
-                f"✅ Valid eventId found ('{event_id}'). Triggering Node.js API..."
-            )
+        
 
-            NODE_API_URL = "https://horaservices.com/api/internal/generate-banner"
+        NODE_API_URL = "https://horaservices.com/api/internal/generate-banner"
 
-            img_response = requests.get(banner_url, timeout=10)
-            img_response.raise_for_status()
+        img_response = requests.get(banner_url, timeout=10)
+        img_response.raise_for_status()
 
-            image_bytes = io.BytesIO(img_response.content)
+        image_bytes = io.BytesIO(img_response.content)
 
-            payload = {"folderId": str(folder_id), "eventId": str(event_id)}
-            files = {"leftImage": ("left_image.jpg", image_bytes, "image/jpeg")}
+        payload = {"folderId": str(folder_id), "eventId": str(event_id)}
+        files = {"leftImage": ("left_image.jpg", image_bytes, "image/jpeg")}
 
-            node_response = requests.post(
-                NODE_API_URL, data=payload, files=files, timeout=30
-            )
-            node_res_data = node_response.json()
+        node_response = requests.post(
+            NODE_API_URL, data=payload, files=files, timeout=30
+        )
+        node_res_data = node_response.json()
 
-            image_bytes.close()
-            node_api_called = True
-        else:
-            print(
-                f"⚠️ eventId missing or null for Folder ID {folder_id}. Node.js API call skipped."
-            )
+        image_bytes.close()
+        node_api_called = True
+        
 
         return {
             "success": True,
