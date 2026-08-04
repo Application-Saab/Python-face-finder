@@ -759,6 +759,10 @@ def cleanup_small_side_face_folders(folderId):
 
 def process_face_clustering_in_background(image_keys, folderId, userId, folder_name):
     try:
+        Folder.objects(id=folderId).update_one(
+            set__clusteringStatus="IN_PROGRESS"
+        )
+
         print(f"Total Images Found = {len(image_keys)}")
         all_embeddings = []
         face_metadata = []
@@ -816,6 +820,9 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
 
         if not all_embeddings:
             print("⚠️ No faces detected in the given images.")
+            Folder.objects(id=folderId).update_one(
+                set__clusteringStatus="DONE",
+            )
             return
 
         # =========================================================
@@ -950,30 +957,51 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
             print(f"🎨 Generating Best Banner Image for Folder (Order ID: {display_order_id})...")
             banner_result = generate_and_save_folder_banner(folderId=folderId)
 
-            if banner_result.get("success"):
-                banner_url = banner_result.get("bannerUrl")
-                NODE_API_URL = "https://horaservices.com/api/internal/generate-banner"
+        # 🟢 STEP 2: EVERYTHING COMPLETED SUCCESSFULLY -> MARK AS 'DONE'
+        Folder.objects(id=folderId).update_one(
+            set__clusteringStatus="DONE"
+        )
 
-                try:
-                    img_response = requests.get(banner_url, timeout=10)
-                    img_response.raise_for_status()
+        print(f"🎨 Generating Best Banner Image for Folder (Order ID: {display_order_id})...")
+        
+        # Call Banner Generator Function
+        banner_result = generate_and_save_folder_banner(folderId=folderId)
+        
+        if banner_result.get("success"):
+            banner_url = banner_result.get("bannerUrl")
+            print(f"🎉 Banner automatically assigned: {banner_url}")
 
-                    image_bytes = io.BytesIO(img_response.content)
-                    payload = {"folderId": str(folderId)}
-                    files = {"leftImage": ("left_image.jpg", image_bytes, "image/jpeg")}
+            folder_doc = Folder.objects(id=folderId).first()
 
-                    response = requests.post(NODE_API_URL, data=payload, files=files, timeout=30)
-                    res_data = response.json()
+                # 2. NodeJS API Endpoint
+            NODE_API_URL = "https://horaservices.com/api/internal/generate-banner" 
 
-                    if response.status_code == 200 and res_data.get("success"):
-                        print(f"✅ Node.js Canvas Banner Generated & Saved: {res_data.get('bannerUrl')}")
-                    else:
-                        print(f"❌ Node.js API Error: {res_data.get('error') or res_data.get('message')}")
+            try:
+                img_response = requests.get(banner_url, timeout=10)
+                img_response.raise_for_status()
+            
+                image_bytes = io.BytesIO(img_response.content)
 
-                    image_bytes.close()
+                payload = {
+                    "folderId": str(folderId),
+                }
 
-                except Exception as req_err:
-                    print(f"❌ Error while calling Node.js Banner API: {str(req_err)}")
+                files = {
+                    "leftImage": ("left_image.jpg", image_bytes, "image/jpeg")
+                }
+
+                response = requests.post(NODE_API_URL, data=payload, files=files, timeout=30)
+                res_data = response.json()
+
+                if response.status_code == 200 and res_data.get("success"):
+                    print(f"✅ Node.js Canvas Banner Generated & Saved: {res_data.get('bannerUrl')}")
+                else:
+                    print(f"❌ Node.js API Error: {res_data.get('error') or res_data.get('message')}")
+
+                image_bytes.close()
+
+            except Exception as req_err:
+                print(f"❌ Error while calling Node.js Banner API: {str(req_err)}")
 
             else:
                 print("❌ Banner generation failed in Python layer.")
@@ -982,7 +1010,9 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
 
     except Exception as e:
         print(f"❌ Error in background face recognition: {str(e)}")
-
+        Folder.objects(id=folderId).update_one(
+            set__clusteringStatus="FAILED"
+        )
 
 
 @app.post("/count-unique-persons")
@@ -1066,32 +1096,26 @@ async def test_generate_banner_endpoint(folder_id: str):
         node_res_data = None
         node_api_called = False
 
-        if event_id and str(event_id).strip():
-            print(
-                f"✅ Valid eventId found ('{event_id}'). Triggering Node.js API..."
-            )
+        
 
-            NODE_API_URL = "https://horaservices.com/api/internal/generate-banner"
+        NODE_API_URL = "https://horaservices.com/api/internal/generate-banner"
 
-            img_response = requests.get(banner_url, timeout=10)
-            img_response.raise_for_status()
+        img_response = requests.get(banner_url, timeout=10)
+        img_response.raise_for_status()
 
-            image_bytes = io.BytesIO(img_response.content)
+        image_bytes = io.BytesIO(img_response.content)
 
-            payload = {"folderId": str(folder_id), "eventId": str(event_id)}
-            files = {"leftImage": ("left_image.jpg", image_bytes, "image/jpeg")}
+        payload = {"folderId": str(folder_id), "eventId": str(event_id)}
+        files = {"leftImage": ("left_image.jpg", image_bytes, "image/jpeg")}
 
-            node_response = requests.post(
-                NODE_API_URL, data=payload, files=files, timeout=30
-            )
-            node_res_data = node_response.json()
+        node_response = requests.post(
+            NODE_API_URL, data=payload, files=files, timeout=30
+        )
+        node_res_data = node_response.json()
 
-            image_bytes.close()
-            node_api_called = True
-        else:
-            print(
-                f"⚠️ eventId missing or null for Folder ID {folder_id}. Node.js API call skipped."
-            )
+        image_bytes.close()
+        node_api_called = True
+        
 
         return {
             "success": True,
