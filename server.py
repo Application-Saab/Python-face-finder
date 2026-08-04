@@ -677,6 +677,10 @@ def upload_face_crop(face_crop, folder_id, person_id):
 
 def process_face_clustering_in_background(image_keys, folderId, userId, folder_name):
     try:
+        Folder.objects(id=folderId).update_one(
+            set__clusteringStatus="IN_PROGRESS"
+        )
+
         print(f"Total Images Found = {len(image_keys)}")
         all_embeddings = []
         face_metadata = []
@@ -730,6 +734,9 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
 
         if not all_embeddings:
             print("⚠️ No faces detected in the given images.")
+            Folder.objects(id=folderId).update_one(
+                set__clusteringStatus="DONE",
+            )
             return
 
         # =========================================================
@@ -834,6 +841,11 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
         else:
             display_order_id = raw_order_id if raw_order_id else 'N/A'
 
+        # 🟢 STEP 2: EVERYTHING COMPLETED SUCCESSFULLY -> MARK AS 'DONE'
+        Folder.objects(id=folderId).update_one(
+            set__clusteringStatus="DONE"
+        )
+
         print(f"🎨 Generating Best Banner Image for Folder (Order ID: {display_order_id})...")
         
         # Call Banner Generator Function
@@ -881,7 +893,9 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
 
     except Exception as e:
         print(f"❌ Error in background face recognition: {str(e)}")
-
+        Folder.objects(id=folderId).update_one(
+            set__clusteringStatus="FAILED"
+        )
 
 @app.post("/count-unique-persons")
 async def count_unique_persons(

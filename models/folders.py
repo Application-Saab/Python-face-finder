@@ -104,6 +104,7 @@ class Folder(Document):
             "orderId",
             "subFolders.userId",
             "deviceTracking.userId",
+            "clusteringStatus",
         ]
     }
     
@@ -150,6 +151,10 @@ class Folder(Document):
 
     totalPersonCount = IntField(default=0)
 
+    clusteringStatus = StringField(
+        default="IN_PROGRESS",
+        choices=["IN_PROGRESS", "DONE", "FAILED"]
+    )
 
     createdAt = DateTimeField(
         default=datetime.utcnow
