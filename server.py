@@ -23,8 +23,6 @@ from typing import List, Tuple
 from models.weblink import WebLinks
 from models.folders import Folder, SubFolder
 import uuid
-from PIL import Image
-import io
 import cv2
 from sklearn.cluster import DBSCAN
 from fastapi import BackgroundTasks
@@ -38,8 +36,8 @@ from eventFaceFinder import router as event_router
 import gc 
 from datetime import datetime
 import requests
-import io
-
+import bson
+from mongoengine.queryset.visitor import Q  
 
 s3_client = boto3.client('s3') 
 BUCKET_NAME = "photography-hora"
@@ -376,21 +374,60 @@ async def search_faces_s3(
         media_type="text/event-stream",
     )
 
-
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
 
-# =========================================================
-# 1. OPTIMIZED: LOW-RES WEBP THUMBNAIL + BATCH PROCESSING (RAM & CPU SAFE)
-# =========================================================
+def find_vips_using_cooccurrence(person_clusters: list, total_images_count: int) -> list:
+    """
+    Identifies VIPs based on shared frames with the primary VIP (P1).
+    """
+    if not person_clusters:
+        return []
+
+    sorted_groups = sorted(person_clusters, key=lambda x: x["count"], reverse=True)
+    
+    min_photos_threshold = max(int(total_images_count * 0.10), 10)
+    
+    p1_group = sorted_groups[0]
+    if p1_group["count"] < min_photos_threshold:
+        return [p1_group]
+
+    p1_images = set(p1_group["images"])
+    vip_groups = [p1_group]
+
+    candidates = sorted_groups[1:]
+
+    for candidate in candidates:
+        if candidate["count"] < min_photos_threshold:
+            continue
+        
+        candidate_images = set(candidate["images"])
+        
+        shared_photos = p1_images.intersection(candidate_images)
+        shared_count = len(shared_photos)
+        
+        co_occurrence_ratio = shared_count / float(candidate["count"])
+        shared_with_p1_ratio = shared_count / float(p1_group["count"])
+
+        print(f"🔍 Co-occurrence Check for {candidate['folderName']}:")
+        print(f"   ├─ Total Photos    : {candidate['count']}")
+        print(f"   ├─ Shared with P1  : {shared_count}")
+        print(f"   └─ Co-occurrence % : {co_occurrence_ratio * 100:.1f}%")
+
+        if co_occurrence_ratio >= 0.25 or shared_with_p1_ratio >= 0.15:
+            vip_groups.append(candidate)
+            print(f"   ✅ CONFIRMED VIP: {candidate['folderName']}")
+            
+            if len(vip_groups) >= 3:
+                break
+        else:
+            print(f"   ❌ REJECTED (High solo photos, but not co-occurring with P1)")
+
+    return vip_groups
+
+
+
 def get_best_banner_image(image_keys: list, expected_vip_count: int) -> str:
-    """
-    Selects the optimal banner image based on:
-    1. Low-Res WebP Thumbnail usage for RAM/CPU safety.
-    2. Batch Processing (10-by-10) to avoid memory leaks.
-    3. Landscape Aspect Ratio enforcement (width > height).
-    4. Exact VIP Face Count Priority (Penalizes extra crowd/guests visually detected).
-    """
     if not image_keys:
         return None
     if len(image_keys) == 1:
@@ -399,25 +436,17 @@ def get_best_banner_image(image_keys: list, expected_vip_count: int) -> str:
     best_key = image_keys[0]
     best_score = -1.0
 
-    # Test top 20 candidate images
     candidates_to_test = image_keys[:20]
     BATCH_SIZE = 10
 
-    # Process candidates in batches
     for batch_start in range(0, len(candidates_to_test), BATCH_SIZE):
         batch_candidates = candidates_to_test[batch_start : batch_start + BATCH_SIZE]
 
         for key in batch_candidates:
             try:
-                # ---------------------------------------------------------
-                #  1. WEBP / THUMBNAIL KEY FETCH (RAM OPTIMIZATION)
-                # ---------------------------------------------------------
                 link_doc = WebLinks.objects(originalKey=key).first() or WebLinks.objects(thumbnailKey=key).first()
-                
-                # Fetch light WebP thumbnailKey from S3 instead of heavy original file
                 target_s3_key = (link_doc.thumbnailKey if link_doc and link_doc.thumbnailKey else key)
 
-                # Fetch object from S3 (~100KB buffer vs ~10MB)
                 s3_obj = s3_client.get_object(Bucket=BUCKET_NAME, Key=target_s3_key)
                 img_bytes = s3_obj['Body'].read()
 
@@ -428,28 +457,16 @@ def get_best_banner_image(image_keys: list, expected_vip_count: int) -> str:
                     continue
 
                 height, width, _ = img.shape
-                
-                # ---------------------------------------------------------
-                # 2. ASPECT RATIO & LANDSCAPE FILTER (UI INTEGRITY)
-                # ---------------------------------------------------------
                 aspect_ratio = width / float(height)
 
-                # Filter out portrait or square images (Landscape required)
                 if aspect_ratio < 1.1: 
                     del img_bytes, nparr, img
                     continue
 
                 gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-                # Sharpness (Laplacian Variance)
                 sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
-
-                # Megapixels Resolution
                 megapixels = (width * height) / 1000000.0
 
-                # ---------------------------------------------------------
-                # 3. FRONT FACE DETECTION (OpenCV)
-                # ---------------------------------------------------------
                 faces = face_cascade.detectMultiScale(
                     gray, 
                     scaleFactor=1.1, 
@@ -458,76 +475,54 @@ def get_best_banner_image(image_keys: list, expected_vip_count: int) -> str:
                 )
                 detected_faces_count = len(faces)
 
-                # ---------------------------------------------------------
-                # 4. SCORING FORMULA WITH STRICT CROWD PENALTY
-                # ---------------------------------------------------------
                 if detected_faces_count == expected_vip_count:
-                    # PERFECT MATCH: Exact number of detected faces matches VIP count
                     face_score_multiplier = 2.0 
-
                 elif detected_faces_count > expected_vip_count:
-                    # CROWD PENALTY: Extra faces detected (VIPs + Crowd/Guests)
                     extra_faces = detected_faces_count - expected_vip_count
-                    # Reduces score by 30% for every extra person found in photo
                     face_score_multiplier = max(0.2, 1.0 - (extra_faces * 0.3))
-
                 else:
-                    # FEWER FACES: Less faces detected than expected VIP count
                     face_score_multiplier = 0.5 if detected_faces_count > 0 else 0.2
 
-                # Cap aspect ratio boost to 1.8x
                 aspect_ratio_multiplier = min(aspect_ratio, 1.8) 
-
-                # Final Composite Score Calculation
                 score = ((sharpness * 0.6) + (megapixels * 20.0)) * face_score_multiplier * aspect_ratio_multiplier
 
                 if score > best_score:
                     best_score = score
-                    # Store original key for DB persistence
                     best_key = key
 
-                # Per-image memory cleanup
                 del img_bytes, nparr, img, gray
 
             except Exception as e:
                 print(f"⚠️ Image score error for {key}: {str(e)}")
                 continue
 
-        # ---------------------------------------------------------
-        # 5. EXPLICIT GARBAGE COLLECTION PER BATCH
-        # ---------------------------------------------------------
         gc.collect()
 
     return best_key
 
+
 # =========================================================
-# 2. STRICT VIP-ONLY FILTER (EXACT COUNT MATCH)
+# 2. STRICT VIP-ONLY FILTER
 # =========================================================
-# Updated filter function with explicit priority logs
 def filter_strict_vip_photos(candidate_keys: list, exact_vip_count: int) -> tuple[list, bool]:
-    """
-    Returns (filtered_candidates, is_pure_vip_only)
-    """
     strict_candidates = []
 
     for key in candidate_keys:
         link_doc = WebLinks.objects(originalKey=key).first() or WebLinks.objects(thumbnailKey=key).first()
         if link_doc and link_doc.folderIds:
-            # Check if tagged folders exactly match VIP count
             if len(link_doc.folderIds) == exact_vip_count:
                 strict_candidates.append(key)
 
     if strict_candidates:
-        return strict_candidates, True  # Pure VIP candidates found!
+        return strict_candidates, True
     
-    return candidate_keys, False  # Fallback to candidates with possible crowd
+    return candidate_keys, False
 
 
-
+# =========================================================
+# 3. MAIN BANNER GENERATOR FUNCTION
+# =========================================================
 def generate_and_save_folder_banner(folderId: str) -> dict:
-    """
-    Clustering ke baad automatic run hone wala banner generator function.
-    """
     try:
         folder_doc = Folder.objects(id=folderId).first()
         if not folder_doc:
@@ -584,28 +579,14 @@ def generate_and_save_folder_banner(folderId: str) -> dict:
             print("⚠️ Tagged WebLinks not found for subfolders.")
             return {"success": False, "message": "No tagged WebLinks found"}
 
-        # VIP Identification Strategy
-        sorted_groups = sorted(person_clusters, key=lambda x: x["count"], reverse=True)
-        min_photos_threshold = max(int(total_images_count * 0.10), 10)
-        vip_groups = []
-
-        for i, group in enumerate(sorted_groups):
-            count = group["count"]
-            if count < min_photos_threshold:
-                break
-            if i == 0:
-                vip_groups.append(group)
-                continue
-                
-            prev_count = sorted_groups[i-1]["count"]
-            if count >= (prev_count * 0.50):
-                vip_groups.append(group)
-            else:
-                break
-
+        vip_groups = find_vips_using_cooccurrence(person_clusters, total_images_count)
         vip_count = len(vip_groups)
-        main_persons_image_sets = [set(vip["images"]) for vip in vip_groups]
 
+        print(f"\n🌟 TOTAL VIPs IDENTIFIED: {vip_count}")
+        for v in vip_groups:
+            print(f"   ⭐ VIP Name: {v['folderName']} (Photos: {v['count']})")
+
+        main_persons_image_sets = [set(vip["images"]) for vip in vip_groups]
         selected_banner_key = None
 
         if vip_count > 1:
@@ -617,21 +598,19 @@ def generate_and_save_folder_banner(folderId: str) -> dict:
             if not selected_banner_key and vip_count >= 3:
                 top_2_common = set.intersection(main_persons_image_sets[0], main_persons_image_sets[1])
                 if top_2_common:
-                    # 🛠️ CHANGE 1: Tuple unpacking added (clean_candidates, _)
                     clean_candidates, _ = filter_strict_vip_photos(list(top_2_common), exact_vip_count=2)
                     selected_banner_key = get_best_banner_image(clean_candidates, expected_vip_count=2)
 
             if not selected_banner_key:
                 union_all = set.union(*main_persons_image_sets)
-                # 🛠️ CHANGE 2: Tuple unpacking added (clean_candidates, _)
                 clean_candidates, _ = filter_strict_vip_photos(list(union_all), exact_vip_count=vip_count)
                 selected_banner_key = get_best_banner_image(clean_candidates, expected_vip_count=vip_count)
 
         elif vip_count == 1:
-            # 🛠️ CHANGE 3: Tuple unpacking added (clean_candidates, _)
             clean_candidates, _ = filter_strict_vip_photos(list(main_persons_image_sets[0]), exact_vip_count=1)
             selected_banner_key = get_best_banner_image(clean_candidates, expected_vip_count=1)
         else:
+            sorted_groups = sorted(person_clusters, key=lambda x: x["count"], reverse=True)
             selected_banner_key = get_best_banner_image(sorted_groups[0]["images"], expected_vip_count=1)
 
         banner_url = None
@@ -649,7 +628,6 @@ def generate_and_save_folder_banner(folderId: str) -> dict:
     except Exception as e:
         print(f"❌ Error in generate_and_save_folder_banner: {str(e)}")
         return {"success": False, "error": str(e)}
-
 
 EPS = 0.6
 MIN_SAMPLES = 2
@@ -673,6 +651,110 @@ def upload_face_crop(face_crop, folder_id, person_id):
 
     crop_url = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{crop_key}"
     return crop_key, crop_url
+
+
+
+
+def is_side_face(face_obj):
+    try:
+        # 1️⃣ Agar InsightFace ne direct Pose Angle (Yaw) detect kiya hai
+        pose = getattr(face_obj, 'pose', None)
+        if pose is not None and len(pose) >= 2:
+            yaw = abs(pose[1])  # Yaw = Head rotation angle (Left/Right)
+            if yaw > 22.0:      # 22 degree se zyaada tilted face ko side face maano
+                return True
+
+        # 2️⃣ Keypoint (Landmark) Asymmetry Check
+        kps = getattr(face_obj, 'kps', None)
+        if kps is None or len(kps) < 5:
+            # Agar landmarks clearly detect nahi hue (extreme side profile)
+            return True
+
+        left_eye, right_eye, nose = kps[0], kps[1], kps[2]
+
+        dist_left = np.linalg.norm(nose - left_eye)
+        dist_right = np.linalg.norm(nose - right_eye)
+
+        max_dist = max(dist_left, dist_right)
+        if max_dist == 0:
+            return True
+
+        asymmetry_ratio = abs(dist_left - dist_right) / max_dist
+
+        # 💡 Threshold ko 0.32 se ghata kar 0.20 kar diya hai
+        # Cropped Face DPs me 20% asymmetry ka matlab clearly Profile / Side Face hai
+        return asymmetry_ratio > 0.20
+
+    except Exception as e:
+        print(f"⚠️ is_side_face check failed: {e}")
+        return False
+
+
+def cleanup_small_side_face_folders(folderId):
+    try:
+        folder_doc = Folder.objects(id=folderId).first()
+        if not folder_doc:
+            print("❌ Folder not found in cleanup")
+            return
+
+        subfolders_to_keep = []
+        removed_count = 0
+
+        for subfolder in folder_doc.subFolders:
+            if not subfolder.isPersonFolder:
+                subfolders_to_keep.append(subfolder)
+                continue
+
+            sub_id = str(subfolder._id)
+
+            # ✅ Live/real-time tagged count — WebLinks DB se (source of truth)
+            actual_tagged_count = WebLinks.objects(folderIds=sub_id).count()
+
+            is_side = getattr(subfolder, "isSideFace", None)
+            should_delete = False
+
+            # 🎯 Core Requirement: isSideFace == True AND tagged count <= 2
+            if is_side is True and actual_tagged_count <= 2:
+                should_delete = True
+                print(f"🔍 SIDE-FACE (Count={actual_tagged_count}): Deleting subfolder {sub_id}")
+
+            # Final Action Block
+            if should_delete:
+                removed_count += 1
+                s3_key = getattr(subfolder.folderDp, "s3Key", None) if subfolder.folderDp else None
+
+                # 1. Delete S3 Crop Image
+                if s3_key:
+                    try:
+                        s3.delete_object(Bucket=S3_BUCKET, Key=s3_key)
+                        print(f"🗑️ S3 crop deleted: {s3_key}")
+                    except Exception as s3_err:
+                        print(f"⚠️ S3 delete failed for {sub_id}: {s3_err}")
+
+                # 2. Untag WebLinks DB
+                try:
+                    WebLinks.objects(folderIds=sub_id).update(pull__folderIds=sub_id)
+                except Exception as tag_err:
+                    print(f"⚠️ Untagging failed for {sub_id}: {tag_err}")
+
+                print(f"🗑️ SUCCESSFULLY REMOVED Side-Face Folder (ID: {sub_id}, Tagged Count: {actual_tagged_count})")
+            else:
+                # Keep folder and sync real count
+                subfolder.personCount = actual_tagged_count
+                subfolders_to_keep.append(subfolder)
+
+        # Database update if any folder removed
+        if removed_count > 0:
+            folder_doc.subFolders = subfolders_to_keep
+            folder_doc.totalPersonCount = max(0, (folder_doc.totalPersonCount or 0) - removed_count)
+            folder_doc.save()
+            print(f"✅ Cleanup completed — Total {removed_count} side-face folder(s) removed.")
+        else:
+            print("✅ Cleanup completed — No side-face folders with <=2 images found.")
+
+    except Exception as e:
+        print(f"❌ Error in cleanup_small_side_face_folders: {str(e)}")
+
 
 
 def process_face_clustering_in_background(image_keys, folderId, userId, folder_name):
@@ -707,29 +789,33 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
 
                 for face in faces:
                     det_score = getattr(face, 'det_score', 1.0)
-                    if det_score < 0.65: 
+                    if det_score < 0.65:
                         continue
 
                     x1, y1, x2, y2 = map(int, face.bbox)
                     face_w, face_h = x2 - x1, y2 - y1
-                    
+
                     if face_w < 35 or face_h < 35:
                         continue
 
                     pad_x, pad_y = int(face_w * 0.20), int(face_h * 0.20)
                     h, w = img.shape[:2]
-                    
+
                     crop_x1 = max(0, x1 - pad_x)
                     crop_y1 = max(0, y1 - pad_y)
                     crop_x2 = min(w, x2 + pad_x)
                     crop_y2 = min(h, y2 + pad_y)
                     face_crop = img[crop_y1:crop_y2, crop_x1:crop_x2]
 
+                    # Side-face decision on original face object
+                    side_flag = is_side_face(face)
+
                     all_embeddings.append(face.embedding)
                     face_metadata.append({
                         "key": key,
                         "face_crop": face_crop.copy() if face_crop.size > 0 else img[y1:y2, x1:x2],
-                        "det_score": det_score
+                        "det_score": det_score,
+                        "is_side": side_flag
                     })
 
         if not all_embeddings:
@@ -747,14 +833,12 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
         labels = clustering.fit_predict(np_embeddings)
 
         cluster_groups = {}
-        unknown_faces_count = 0
-        noise_id_counter = -2 
+        noise_id_counter = -2
 
         for label, metadata in zip(labels, face_metadata):
             if label == -1:
                 current_group_id = noise_id_counter
                 noise_id_counter -= 1
-                unknown_faces_count += 1
             else:
                 current_group_id = label
 
@@ -762,84 +846,116 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                 cluster_groups[current_group_id] = {
                     "images": [],
                     "best_crop": metadata["face_crop"],
-                    "max_score": metadata["det_score"]
+                    "max_score": metadata["det_score"],
+                    "best_is_side": metadata["is_side"]
                 }
-            
+
             if metadata["key"] not in cluster_groups[current_group_id]["images"]:
                 cluster_groups[current_group_id]["images"].append(metadata["key"])
-                
+
             if metadata["det_score"] > cluster_groups[current_group_id]["max_score"]:
                 cluster_groups[current_group_id]["best_crop"] = metadata["face_crop"]
                 cluster_groups[current_group_id]["max_score"] = metadata["det_score"]
+                cluster_groups[current_group_id]["best_is_side"] = metadata["is_side"]
 
         # =========================================================
-        # STAGE 3: DB PERSISTENCE & S3 UPLOAD
+        # STAGE 3: TAGGING & SIDE-FACE CLEANUP (EXACT SCHEMA MATCH)
+        # =========================================================
+        print("\n🚀 STARTING IMAGE TAGGING & CLEANUP PROCESS")
+        valid_subfolders = []
+        removed_side_count = 0
+
+        for group_id, group_data in cluster_groups.items():
+            person_id = str(uuid.uuid4())
+            crop_key, crop_url = upload_face_crop(group_data["best_crop"], folderId, person_id)
+            sub_id = str(bson.ObjectId())  # String representation for subfolder ID
+
+            group_keys = group_data["images"]
+            group_filenames = [k.split("/")[-1] for k in group_keys if "/" in k]
+
+            # 1. Bulk Tagging mapped directly to WebLinks Schema (mainFolderId, thumbnailKey, originalKey)
+            try:
+                folder_filter = Q(mainFolderId=folderId)
+                key_filter = (
+                    Q(thumbnailKey__in=group_keys) | 
+                    Q(originalKey__in=group_keys) | 
+                    Q(thumbnailKey__in=group_filenames) | 
+                    Q(originalKey__in=group_filenames)
+                )
+
+                WebLinks.objects(folder_filter & key_filter).update(add_to_set__folderIds=sub_id)
+
+            except Exception as e:
+                print(f"❌ Failed Bulk Tagging for Subfolder {sub_id}: {str(e)}")
+
+            # 2. Check Tagged Count from DB
+            actual_tagged_count = WebLinks.objects(folderIds=sub_id).count()
+            print(f"📊 Subfolder {sub_id} tagged count: {actual_tagged_count}")
+
+            # 3. Filter Check: Side Face + Count <= 2
+            if group_data["best_is_side"] is True and actual_tagged_count <= 2:
+                removed_side_count += 1
+                print(f"🔍 SIDE-FACE FILTER (Count={actual_tagged_count}): Deleting crop & untagging subfolder {sub_id}")
+
+                # Delete Crop from S3
+                try:
+                    s3.delete_object(Bucket=S3_BUCKET, Key=crop_key)
+                except Exception as s3_err:
+                    print(f"⚠️ S3 delete failed for {sub_id}: {s3_err}")
+
+                # Untag WebLinks
+                try:
+                    WebLinks.objects(folderIds=sub_id).update(pull__folderIds=sub_id)
+                except Exception as tag_err:
+                    print(f"⚠️ Untagging failed for {sub_id}: {tag_err}")
+            else:
+                # Valid Subfolder -> Append to list
+                subfolder = SubFolder(
+                    _id=sub_id,
+                    folderName="Person",
+                    type="others",
+                    userId=userId,
+                    personCount=actual_tagged_count,
+                    isPersonFolder=True,
+                    isSideFace=group_data["best_is_side"],
+                    folderDp={
+                        "fileUrl": crop_url,
+                        "thumbnailUrl": crop_url,
+                        "s3Key": crop_key,
+                        "thumbnailKey": crop_key
+                    }
+                )
+                valid_subfolders.append(subfolder)
+
+        print(f"✅ TAGGING & CLEANUP COMPLETED (Filtered out {removed_side_count} small side-face folders)")
+
+        # =========================================================
+        # STAGE 4: FINAL DB SAVE
         # =========================================================
         folder_doc = Folder.objects(id=folderId).first()
         if not folder_doc:
             print("❌ Folder not found in background task")
             return
-        
+
         current_ai_person_count = folder_doc.totalPersonCount or 0
-        new_ai_persons_detected = len(cluster_groups)
 
-        created_subfolders = []
-        for group_id, group_data in cluster_groups.items():
-            person_id = str(uuid.uuid4())
-            crop_key, crop_url = upload_face_crop(group_data["best_crop"], folderId, person_id)
-
-            display_name = f"Person"
-
-            subfolder = SubFolder(
-                folderName=display_name,
-                type="others",
-                userId=userId,
-                personCount=len(group_data["images"]),
-                isPersonFolder=True,
-                folderDp={
-                    "fileUrl": crop_url,
-                    "thumbnailUrl": crop_url,
-                    "s3Key": crop_key,
-                    "thumbnailKey": crop_key
-                }
-            )
-            folder_doc.subFolders.append(subfolder)
-
-            created_subfolders.append({
-                "subFolderId": str(subfolder._id),
-                "images": group_data["images"]
-            })
-
-        folder_doc.totalPersonCount = current_ai_person_count + new_ai_persons_detected
-        folder_doc.uniqueFaceCount = len(cluster_groups)
-        folder_doc.save()
-        print("✅ Folder Database Setup Success")
-
-        # =====================================================
-        # STAGE 4: IMAGE TAGGING PROCESS
-        # =====================================================
-        print("\n🚀 STARTING IMAGE TAGGING PROCESS")
-        for sub_info in created_subfolders:
-            sub_folder_id = sub_info["subFolderId"]
-            for image_key in sub_info["images"]:
-                try:
-                    filename = image_key.split("/")[-1]
-                    WebLinks.objects(thumbnailKey__endswith=filename).update(
-                        add_to_set__folderIds=sub_folder_id
-                    )
-                except Exception as e:
-                    print(f"❌ Failed Tagging {image_key}: {str(e)}")
-        print("\n✅ IMAGE TAGGING COMPLETED")
-
-        # -----------------------------------------------------
-        # SAFE ORDER ID EXTRACTION FOR LOGGING
-        # -----------------------------------------------------
-        raw_order_id = getattr(folder_doc, 'orderId', None) if 'folder_doc' in locals() and folder_doc else 'N/A'
+        folder_doc.subFolders.extend(valid_subfolders)
+        folder_doc.totalPersonCount = current_ai_person_count + len(valid_subfolders)
+        folder_doc.uniqueFaceCount = len(valid_subfolders)
         
-        if str(raw_order_id).isdigit():
-            display_order_id = int(raw_order_id) + 10800
-        else:
-            display_order_id = raw_order_id if raw_order_id else 'N/A'
+        folder_doc.save()
+        print("✅ Folder Database Setup Success - All verified subfolders saved to DB")
+
+        # =========================================================
+        # STAGE 5: BANNER GENERATION
+        # =========================================================
+        raw_order_id = getattr(folder_doc, 'orderId', None) if folder_doc else 'N/A'
+        display_order_id = int(raw_order_id) + 10800 if str(raw_order_id).isdigit() else raw_order_id
+        event_id = getattr(folder_doc, "eventId", None) if folder_doc else None
+
+        if event_id and str(event_id).strip():
+            print(f"🎨 Generating Best Banner Image for Folder (Order ID: {display_order_id})...")
+            banner_result = generate_and_save_folder_banner(folderId=folderId)
 
         # 🟢 STEP 2: EVERYTHING COMPLETED SUCCESSFULLY -> MARK AS 'DONE'
         Folder.objects(id=folderId).update_one(
@@ -887,9 +1003,10 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
             except Exception as req_err:
                 print(f"❌ Error while calling Node.js Banner API: {str(req_err)}")
 
-
+            else:
+                print("❌ Banner generation failed in Python layer.")
         else:
-            print("❌ Banner generation failed in Python layer.")
+            print(f"⚠️ eventId is missing or null for Folder ID {folderId}. Skipping banner generation.")
 
     except Exception as e:
         print(f"❌ Error in background face recognition: {str(e)}")
@@ -897,24 +1014,40 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
             set__clusteringStatus="FAILED"
         )
 
+
 @app.post("/count-unique-persons")
 async def count_unique_persons(
     background_tasks: BackgroundTasks,
     folder_name: str = Form(...),
     folderId: str = Form(...),
-    userId: str = Form(...)
+    userId: str = Form(...)  # ✅ Changed from userId to customerId
 ):
     try:
         image_keys = list_s3_images(folder_name)
 
         if not image_keys:
+            print(f"⚠️ [API] No images found in S3 bucket for folder: {folder_name} (ID: {folderId})")
             return {"success": False, "message": "No images found in S3 bucket"}
         
+        # Folder doc se orderId aur folderName fetch kar rahe hain for logging
+        folder_doc = Folder.objects(id=folderId).first()
+        orderId = getattr(folder_doc, "orderId", "N/A") if folder_doc else "N/A"
+        display_name = getattr(folder_doc, "folderName", folder_name) if folder_doc else folder_name
+
+        print("\n" + "📥" * 30)
+        print(f"📌 [API RECEIVED] Count Unique Persons Triggered")
+        print(f"📁 Folder Name : {display_name}")
+        print(f"🆔 Folder ID   : {folderId}")
+        print(f"📦 Order ID    : {orderId}")  # ✅ Using orderId key
+        print(f"👤 Customer ID : {userId}")  # ✅ Using customerId
+        print(f"🖼️ S3 Images   : {len(image_keys)} files found")
+        print("📥" * 30 + "\n")
+
         background_tasks.add_task(
             process_face_clustering_in_background, 
             image_keys, 
             folderId, 
-            userId, 
+            userId,  # ✅ Passing customerId as userId parameter
             folder_name
         )
 
@@ -925,9 +1058,10 @@ async def count_unique_persons(
         }
 
     except Exception as e:
+        print(f"❌ [API ERROR] Failed to initialize face count: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
+    
 @app.post("/api/test/generate-banner/{folder_id}")
 async def test_generate_banner_endpoint(folder_id: str):
     """Directly triggers banner scoring logic & Node.js API call only if eventId exists in the folder."""
