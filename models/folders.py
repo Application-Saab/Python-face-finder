@@ -44,6 +44,8 @@ class SubFolder(EmbeddedDocument):
         required=True
     )
 
+    isSideFace = BooleanField(default=None, null=True)
+
     personCount = IntField(default=0)
 
     isPersonFolder = BooleanField(default=False)
