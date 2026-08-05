@@ -651,9 +651,102 @@ def generate_and_save_folder_banner(folderId: str) -> dict:
         return {"success": False, "error": str(e)}
 
 
+import io
+import uuid
+import numpy as np
+import torch
+import open_clip
+from PIL import Image
+from sklearn.cluster import DBSCAN
+ 
 EPS = 0.6
 MIN_SAMPLES = 2
-
+ 
+# =====================================================================
+# NAYA ADDITION #1: CLIP model ek hi baar yaha load hota hai (file ke
+# top pe, function ke bahar) — taaki har baar dubara load na ho.
+# =====================================================================
+_CLIP_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+ 
+_clip_model, _, _clip_preprocess = open_clip.create_model_and_transforms(
+    "ViT-B-32", pretrained="openai"
+)
+_clip_model.eval().to(_CLIP_DEVICE)
+_clip_tokenizer = open_clip.get_tokenizer("ViT-B-32")
+ 
+_REAL_PROMPTS = [
+    "a photo of a real human face",
+    "a close-up photograph of a person's face",
+    "a candid photo of a human face",
+    "a portrait photograph of a real person",
+]
+_FAKE_PROMPTS = [
+    "a doll's face",
+    "a cartoon or anime character face",
+    "a statue or sculpture face",
+    "a mannequin face",
+    "an illustration or painting of a face",
+    "a costume or animal mask face",
+    "a toy or action figure face",
+]
+ 
+with torch.no_grad():
+    _real_tok = _clip_tokenizer(_REAL_PROMPTS).to(_CLIP_DEVICE)
+    _fake_tok = _clip_tokenizer(_FAKE_PROMPTS).to(_CLIP_DEVICE)
+ 
+    _real_emb = _clip_model.encode_text(_real_tok)
+    _fake_emb = _clip_model.encode_text(_fake_tok)
+ 
+    _real_emb = _real_emb / _real_emb.norm(dim=-1, keepdim=True)
+    _fake_emb = _fake_emb / _fake_emb.norm(dim=-1, keepdim=True)
+ 
+    _REAL_ANCHOR = _real_emb.mean(dim=0, keepdim=True)
+    _FAKE_ANCHOR = _fake_emb.mean(dim=0, keepdim=True)
+    _REAL_ANCHOR = _REAL_ANCHOR / _REAL_ANCHOR.norm(dim=-1, keepdim=True)
+    _FAKE_ANCHOR = _FAKE_ANCHOR / _FAKE_ANCHOR.norm(dim=-1, keepdim=True)
+ 
+REAL_FACE_THRESHOLD = 0.60  # apne data pe test karke adjust karein
+ 
+ 
+# =====================================================================
+# NAYA ADDITION #2: batched filter function — pura ek batch (10 images
+# ke saare faces) ek saath check karta hai, isliye slow nahi hota.
+# =====================================================================
+def is_real_human_face_batch(face_crops, threshold=REAL_FACE_THRESHOLD, batch_size=64):
+    """
+    face_crops: list of RGB numpy arrays (aapke face crops).
+    Return: list of (is_real: bool, score: float), face_crops ke order mein.
+    """
+    results = [None] * len(face_crops)
+    valid_idx = [i for i, c in enumerate(face_crops) if c is not None and c.size > 0]
+ 
+    for start in range(0, len(valid_idx), batch_size):
+        chunk_idx = valid_idx[start:start + batch_size]
+        tensors = torch.stack(
+            [_clip_preprocess(Image.fromarray(face_crops[i])) for i in chunk_idx]
+        ).to(_CLIP_DEVICE)
+ 
+        with torch.no_grad():
+            img_emb = _clip_model.encode_image(tensors)
+            img_emb = img_emb / img_emb.norm(dim=-1, keepdim=True)
+ 
+            real_sim = (img_emb @ _REAL_ANCHOR.T).squeeze(-1)
+            fake_sim = (img_emb @ _FAKE_ANCHOR.T).squeeze(-1)
+ 
+            stacked = torch.stack([real_sim, fake_sim], dim=1) * 100
+            probs = torch.softmax(stacked, dim=1)[:, 0]
+ 
+        for local_i, global_i in enumerate(chunk_idx):
+            score = float(probs[local_i])
+            results[global_i] = (score >= threshold, score)
+ 
+    for i in range(len(face_crops)):
+        if results[i] is None:
+            results[i] = (False, 0.0)
+ 
+    return results
+ 
+ 
 def upload_face_crop(face_crop, folder_id, person_id):
     buffer = io.BytesIO()
     Image.fromarray(face_crop).save(
@@ -662,7 +755,7 @@ def upload_face_crop(face_crop, folder_id, person_id):
         quality=90
     )
     buffer.seek(0)
-
+ 
     crop_key = f"face-groups/{folder_id}/{person_id}.webp"
     s3.upload_fileobj(
         buffer,
@@ -670,79 +763,110 @@ def upload_face_crop(face_crop, folder_id, person_id):
         crop_key,
         ExtraArgs={"ContentType": "image/webp"}
     )
-
+ 
     crop_url = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{crop_key}"
     return crop_key, crop_url
-
-
+ 
+ 
 def process_face_clustering_in_background(image_keys, folderId, userId, folder_name):
     try:
         print(f"Total Images Found = {len(image_keys)}")
         all_embeddings = []
         face_metadata = []
-
+ 
         BATCH_SIZE = 10
         batches = [
             image_keys[i:i + BATCH_SIZE]
             for i in range(0, len(image_keys), BATCH_SIZE)
         ]
-
+ 
         # =========================================================
-        # STAGE 1: EXTRACT EMBEDDINGS FROM ALL IMAGES
+        # STAGE 1: EXTRACT EMBEDDINGS FROM ALL IMAGES  (UPDATED)
         # =========================================================
         for keys in batches:
             imgs = [read_s3_image(k) for k in keys]
-
+ 
+            # NAYA ADDITION #3: is image-batch ke saare candidate faces
+            # pehle yaha collect honge, embeddings mein turant nahi jayenge
+            batch_candidates = []
+ 
             for img, key in zip(imgs, keys):
                 if img is None:
                     continue
-
+ 
                 faces = searcher.app.get(img)
                 if not faces:
                     continue
-
+ 
                 for face in faces:
                     det_score = getattr(face, 'det_score', 1.0)
-                    if det_score < 0.65: 
+                    if det_score < 0.65:
                         continue
-
+ 
                     x1, y1, x2, y2 = map(int, face.bbox)
                     face_w, face_h = x2 - x1, y2 - y1
-                    
+ 
                     if face_w < 35 or face_h < 35:
                         continue
-
+ 
                     pad_x, pad_y = int(face_w * 0.20), int(face_h * 0.20)
                     h, w = img.shape[:2]
-                    
+ 
                     crop_x1 = max(0, x1 - pad_x)
                     crop_y1 = max(0, y1 - pad_y)
                     crop_x2 = min(w, x2 + pad_x)
                     crop_y2 = min(h, y2 + pad_y)
                     face_crop = img[crop_y1:crop_y2, crop_x1:crop_x2]
-
-                    all_embeddings.append(face.embedding)
-                    face_metadata.append({
+                    if face_crop.size == 0:
+                        face_crop = img[y1:y2, x1:x2]
+ 
+                    # PEHLE: yaha direct all_embeddings.append() ho raha tha.
+                    # AB: pehle candidates list mein daalte hain
+                    batch_candidates.append({
                         "key": key,
-                        "face_crop": face_crop.copy() if face_crop.size > 0 else img[y1:y2, x1:x2],
-                        "det_score": det_score
+                        "face_crop": face_crop.copy(),
+                        "det_score": det_score,
+                        "embedding": face.embedding,
                     })
-
+ 
+            if not batch_candidates:
+                continue
+ 
+            # =====================================================
+            # NAYA ADDITION #4: yaha CLIP filter chalta hai — is
+            # image-batch ke saare faces ek saath check hote hain
+            # =====================================================
+            crops = [c["face_crop"] for c in batch_candidates]
+            human_results = is_real_human_face_batch(crops)
+ 
+            for candidate, (is_human, score) in zip(batch_candidates, human_results):
+                if not is_human:
+                    print(f"🚫 Non-human face rejected (score={score:.2f}): {candidate['key']}")
+                    continue
+ 
+                # Sirf REAL human faces hi embeddings/metadata mein jaate hain
+                all_embeddings.append(candidate["embedding"])
+                face_metadata.append({
+                    "key": candidate["key"],
+                    "face_crop": candidate["face_crop"],
+                    "det_score": candidate["det_score"]
+                })
+ 
         if not all_embeddings:
             print("⚠️ No faces detected in the given images.")
             return
-
+ 
         # =========================================================
-        # STAGE 2: DBSCAN CLUSTERING
+        # STAGE 2: DBSCAN CLUSTERING  (koi change nahi)
         # =========================================================
         np_embeddings = np.array(all_embeddings)
         clustering = DBSCAN(eps=EPS, min_samples=MIN_SAMPLES, metric="cosine")
         labels = clustering.fit_predict(np_embeddings)
-
+ 
         cluster_groups = {}
         unknown_faces_count = 0
-        noise_id_counter = -2 
-
+        noise_id_counter = -2
+ 
         for label, metadata in zip(labels, face_metadata):
             if label == -1:
                 current_group_id = noise_id_counter
@@ -750,39 +874,39 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                 unknown_faces_count += 1
             else:
                 current_group_id = label
-
+ 
             if current_group_id not in cluster_groups:
                 cluster_groups[current_group_id] = {
                     "images": [],
                     "best_crop": metadata["face_crop"],
                     "max_score": metadata["det_score"]
                 }
-            
+ 
             if metadata["key"] not in cluster_groups[current_group_id]["images"]:
                 cluster_groups[current_group_id]["images"].append(metadata["key"])
-                
+ 
             if metadata["det_score"] > cluster_groups[current_group_id]["max_score"]:
                 cluster_groups[current_group_id]["best_crop"] = metadata["face_crop"]
                 cluster_groups[current_group_id]["max_score"] = metadata["det_score"]
-
+ 
         # =========================================================
-        # STAGE 3: DB PERSISTENCE & S3 UPLOAD
+        # STAGE 3: DB PERSISTENCE & S3 UPLOAD  (koi change nahi)
         # =========================================================
         folder_doc = Folder.objects(id=folderId).first()
         if not folder_doc:
             print("❌ Folder not found in background task")
             return
-        
+ 
         current_ai_person_count = folder_doc.totalPersonCount or 0
         new_ai_persons_detected = len(cluster_groups)
-
+ 
         created_subfolders = []
         for group_id, group_data in cluster_groups.items():
             person_id = str(uuid.uuid4())
             crop_key, crop_url = upload_face_crop(group_data["best_crop"], folderId, person_id)
-
+ 
             display_name = f"Person"
-
+ 
             subfolder = SubFolder(
                 folderName=display_name,
                 type="others",
@@ -797,19 +921,19 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                 }
             )
             folder_doc.subFolders.append(subfolder)
-
+ 
             created_subfolders.append({
                 "subFolderId": str(subfolder._id),
                 "images": group_data["images"]
             })
-
+ 
         folder_doc.totalPersonCount = current_ai_person_count + new_ai_persons_detected
         folder_doc.uniqueFaceCount = len(cluster_groups)
         folder_doc.save()
         print("✅ Folder Database Setup Success")
-
+ 
         # =====================================================
-        # STAGE 4: IMAGE TAGGING PROCESS
+        # STAGE 4: IMAGE TAGGING PROCESS  (koi change nahi)
         # =====================================================
         print("\n🚀 STARTING IMAGE TAGGING PROCESS")
         for sub_info in created_subfolders:
@@ -823,73 +947,71 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                 except Exception as e:
                     print(f"❌ Failed Tagging {image_key}: {str(e)}")
         print("\n✅ IMAGE TAGGING COMPLETED")
-
+ 
         # -----------------------------------------------------
-        # SAFE ORDER ID EXTRACTION FOR LOGGING
+        # SAFE ORDER ID EXTRACTION FOR LOGGING  (koi change nahi)
         # -----------------------------------------------------
         raw_order_id = getattr(folder_doc, 'orderId', None) if 'folder_doc' in locals() and folder_doc else 'N/A'
-        
+ 
         if str(raw_order_id).isdigit():
             display_order_id = int(raw_order_id) + 10800
         else:
             display_order_id = raw_order_id if raw_order_id else 'N/A'
-
+ 
         print(f"🎨 Generating Best Banner Image for Folder (Order ID: {display_order_id})...")
-        
+ 
         # Call Banner Generator Function
         banner_result = generate_and_save_folder_banner(folderId=folderId)
-        
+ 
         if banner_result.get("success"):
             banner_url = banner_result.get("bannerUrl")
             print(f"🎉 Banner automatically assigned: {banner_url}")
-
+ 
             folder_doc = Folder.objects(id=folderId).first()
             event_id = getattr(folder_doc, "eventId", None) if folder_doc else None
-            
-            # Check if eventId exists and is valid (not None, null, or empty string)
+ 
             if event_id and str(event_id).strip():
                 print(f"✅ eventId found ('{event_id}'). Calling Node.js Canvas API...")
-
-                # 2. NodeJS API Endpoint
-                NODE_API_URL = "https://horaservices.com/api/internal/generate-banner" 
-
+ 
+                NODE_API_URL = "https://horaservices.com/api/internal/generate-banner"
+ 
                 try:
                     img_response = requests.get(banner_url, timeout=10)
                     img_response.raise_for_status()
-            
+ 
                     image_bytes = io.BytesIO(img_response.content)
-
+ 
                     payload = {
                         "folderId": str(folderId),
                     }
-
+ 
                     files = {
                         "leftImage": ("left_image.jpg", image_bytes, "image/jpeg")
                     }
-
+ 
                     response = requests.post(NODE_API_URL, data=payload, files=files, timeout=30)
                     res_data = response.json()
-
+ 
                     if response.status_code == 200 and res_data.get("success"):
                         print(f"✅ Node.js Canvas Banner Generated & Saved: {res_data.get('bannerUrl')}")
                     else:
                         print(f"❌ Node.js API Error: {res_data.get('error') or res_data.get('message')}")
-
+ 
                     image_bytes.close()
-
+ 
                 except Exception as req_err:
                     print(f"❌ Error while calling Node.js Banner API: {str(req_err)}")
-
+ 
             else:
                 print(f"⚠️ eventId is missing or null for Folder ID {folderId}. Skipping Node.js API call.")
-
+ 
         else:
             print("❌ Banner generation failed in Python layer.")
-
+ 
     except Exception as e:
         print(f"❌ Error in background face recognition: {str(e)}")
-
-
+ 
+ 
 @app.post("/count-unique-persons")
 async def count_unique_persons(
     background_tasks: BackgroundTasks,
@@ -899,113 +1021,28 @@ async def count_unique_persons(
 ):
     try:
         image_keys = list_s3_images(folder_name)
-
+ 
         if not image_keys:
             return {"success": False, "message": "No images found in S3 bucket"}
-        
+ 
         background_tasks.add_task(
-            process_face_clustering_in_background, 
-            image_keys, 
-            folderId, 
-            userId, 
+            process_face_clustering_in_background,
+            image_keys,
+            folderId,
+            userId,
             folder_name
         )
-
+ 
         return {
             "success": True,
             "message": "Face recognition and clustering started in background.",
             "totalPhotosFound": len(image_keys)
         }
-
+ 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/test/generate-banner/{folder_id}")
-async def test_generate_banner_endpoint(folder_id: str):
-    """Directly triggers banner scoring logic & Node.js API call only if eventId exists in the folder."""
-    try:
-        print("\n==================================================")
-        print(f"🧪 TEST API HIT: Generating Banner for Folder {folder_id}")
-        print("==================================================\n")
-
-        folder_doc = Folder.objects(id=folder_id).first()
-
-        if not folder_doc:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Folder not found with id: {folder_id}",
-            )
-
-        banner_result = generate_and_save_folder_banner(folderId=folder_id)
-
-        if not banner_result.get("success"):
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "message": "Fail banner selection",
-                    "details": banner_result,
-                },
-            )
-
-        banner_url = banner_result.get("bannerUrl")
-        selected_key = banner_result.get("selectedKey")
-
-        event_id = getattr(folder_doc, "eventId", None)
-        node_res_data = None
-        node_api_called = False
-
-        if event_id and str(event_id).strip():
-            print(
-                f"✅ Valid eventId found ('{event_id}'). Triggering Node.js API..."
-            )
-
-            NODE_API_URL = "https://horaservices.com/api/internal/generate-banner"
-
-            img_response = requests.get(banner_url, timeout=10)
-            img_response.raise_for_status()
-
-            image_bytes = io.BytesIO(img_response.content)
-
-            payload = {"folderId": str(folder_id), "eventId": str(event_id)}
-            files = {"leftImage": ("left_image.jpg", image_bytes, "image/jpeg")}
-
-            node_response = requests.post(
-                NODE_API_URL, data=payload, files=files, timeout=30
-            )
-            node_res_data = node_response.json()
-
-            image_bytes.close()
-            node_api_called = True
-        else:
-            print(
-                f"⚠️ eventId missing or null for Folder ID {folder_id}. Node.js API call skipped."
-            )
-
-        return {
-            "success": True,
-            "message": (
-                "Banner generated and pushed to Node.js successfully!"
-                if node_api_called
-                else "Banner selected in Python, but Node.js API skipped because eventId does not exist."
-            ),
-            "data": {
-                "folderId": folder_id,
-                "eventId": event_id,
-                "selectedKey": selected_key,
-                "bannerUrl": banner_url,
-                "nodeApiCalled": node_api_called,
-                "nodeApiResponse": node_res_data,
-            },
-        }
-
-    except HTTPException as http_ex:
-        raise http_ex
-    except Exception as e:
-        print(f"❌ Error in test_generate_banner_endpoint: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-    
 # Serve index.html at root
 @app.get("/", response_class=HTMLResponse)
 async def serve_index():
