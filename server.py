@@ -38,6 +38,8 @@ from datetime import datetime
 import requests
 import bson
 from mongoengine.queryset.visitor import Q  
+import open_clip
+import torch
 
 s3_client = boto3.client('s3') 
 BUCKET_NAME = "photography-hora"
@@ -632,6 +634,92 @@ def generate_and_save_folder_banner(folderId: str) -> dict:
 EPS = 0.6
 MIN_SAMPLES = 2
 
+
+
+# =====================================================================
+# NAYA ADDITION #1: CLIP model ek hi baar yaha load hota hai (file ke
+# top pe, function ke bahar) — taaki har baar dubara load na ho.
+# =====================================================================
+_CLIP_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+ 
+_clip_model, _, _clip_preprocess = open_clip.create_model_and_transforms(
+    "ViT-B-32", pretrained="openai"
+)
+_clip_model.eval().to(_CLIP_DEVICE)
+_clip_tokenizer = open_clip.get_tokenizer("ViT-B-32")
+ 
+_REAL_PROMPTS = [
+    "a photo of a real human face",
+    "a close-up photograph of a person's face",
+    "a candid photo of a human face",
+    "a portrait photograph of a real person",
+]
+_FAKE_PROMPTS = [
+    "a doll's face",
+    "a cartoon or anime character face",
+    "a statue or sculpture face",
+    "a mannequin face",
+    "an illustration or painting of a face",
+    "a costume or animal mask face",
+    "a toy or action figure face",
+]
+ 
+with torch.no_grad():
+    _real_tok = _clip_tokenizer(_REAL_PROMPTS).to(_CLIP_DEVICE)
+    _fake_tok = _clip_tokenizer(_FAKE_PROMPTS).to(_CLIP_DEVICE)
+ 
+    _real_emb = _clip_model.encode_text(_real_tok)
+    _fake_emb = _clip_model.encode_text(_fake_tok)
+ 
+    _real_emb = _real_emb / _real_emb.norm(dim=-1, keepdim=True)
+    _fake_emb = _fake_emb / _fake_emb.norm(dim=-1, keepdim=True)
+ 
+    _REAL_ANCHOR = _real_emb.mean(dim=0, keepdim=True)
+    _FAKE_ANCHOR = _fake_emb.mean(dim=0, keepdim=True)
+    _REAL_ANCHOR = _REAL_ANCHOR / _REAL_ANCHOR.norm(dim=-1, keepdim=True)
+    _FAKE_ANCHOR = _FAKE_ANCHOR / _FAKE_ANCHOR.norm(dim=-1, keepdim=True)
+ 
+REAL_FACE_THRESHOLD = 0.60  # apne data pe test karke adjust karein
+
+
+# =====================================================================
+# NAYA ADDITION #2: batched filter function — pura ek batch (10 images
+# ke saare faces) ek saath check karta hai, isliye slow nahi hota.
+# =====================================================================
+def is_real_human_face_batch(face_crops, threshold=REAL_FACE_THRESHOLD, batch_size=64):
+    """
+    face_crops: list of RGB numpy arrays (aapke face crops).
+    Return: list of (is_real: bool, score: float), face_crops ke order mein.
+    """
+    results = [None] * len(face_crops)
+    valid_idx = [i for i, c in enumerate(face_crops) if c is not None and c.size > 0]
+ 
+    for start in range(0, len(valid_idx), batch_size):
+        chunk_idx = valid_idx[start:start + batch_size]
+        tensors = torch.stack(
+            [_clip_preprocess(Image.fromarray(face_crops[i])) for i in chunk_idx]
+        ).to(_CLIP_DEVICE)
+ 
+        with torch.no_grad():
+            img_emb = _clip_model.encode_image(tensors)
+            img_emb = img_emb / img_emb.norm(dim=-1, keepdim=True)
+ 
+            real_sim = (img_emb @ _REAL_ANCHOR.T).squeeze(-1)
+            fake_sim = (img_emb @ _FAKE_ANCHOR.T).squeeze(-1)
+ 
+            stacked = torch.stack([real_sim, fake_sim], dim=1) * 100
+            probs = torch.softmax(stacked, dim=1)[:, 0]
+ 
+        for local_i, global_i in enumerate(chunk_idx):
+            score = float(probs[local_i])
+            results[global_i] = (score >= threshold, score)
+ 
+    for i in range(len(face_crops)):
+        if results[i] is None:
+            results[i] = (False, 0.0)
+ 
+    return results
+
 def upload_face_crop(face_crop, folder_id, person_id):
     buffer = io.BytesIO()
     Image.fromarray(face_crop).save(
@@ -779,6 +867,8 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
         for keys in batches:
             imgs = [read_s3_image(k) for k in keys]
 
+            batch_candidates = []
+
             for img, key in zip(imgs, keys):
                 if img is None:
                     continue
@@ -806,17 +896,47 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                     crop_x2 = min(w, x2 + pad_x)
                     crop_y2 = min(h, y2 + pad_y)
                     face_crop = img[crop_y1:crop_y2, crop_x1:crop_x2]
+                    if face_crop.size == 0:
+                        face_crop = img[y1:y2, x1:x2]
+ 
+                    # PEHLE: yaha direct all_embeddings.append() ho raha tha.
+                    # AB: pehle candidates list mein daalte hain
+                    batch_candidates.append({
+                        "key": key,
+                        "face_crop": face_crop.copy(),
+                        "det_score": det_score,
+                        "embedding": face.embedding,
+                        "is_side": is_side_face(face),
+                    })
+ 
+                if not batch_candidates:
+                       continue
+ 
+            # =====================================================
+            # NAYA ADDITION #4: yaha CLIP filter chalta hai — is
+            # image-batch ke saare faces ek saath check hote hain
+            # =====================================================
+                crops = [c["face_crop"] for c in batch_candidates]
+                human_results = is_real_human_face_batch(crops)
+ 
+                for candidate, (is_human, score) in zip(batch_candidates, human_results):
+                    if not is_human:
+                        print(f"🚫 Non-human face rejected (score={score:.2f}): {candidate['key']}")
+                        continue
+ 
+                # Sirf REAL human faces hi embeddings/metadata mein jaate hain
+                    all_embeddings.append(candidate["embedding"])
+                    face_metadata.append({
+                        "key": candidate["key"],
+                        "face_crop": candidate["face_crop"],
+                        "det_score": candidate["det_score"],
+                        "is_side": candidate["is_side"] 
+                   })
 
                     # Side-face decision on original face object
                     side_flag = is_side_face(face)
 
-                    all_embeddings.append(face.embedding)
-                    face_metadata.append({
-                        "key": key,
-                        "face_crop": face_crop.copy() if face_crop.size > 0 else img[y1:y2, x1:x2],
-                        "det_score": det_score,
-                        "is_side": side_flag
-                    })
+                    
 
         if not all_embeddings:
             print("⚠️ No faces detected in the given images.")
