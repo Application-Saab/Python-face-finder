@@ -631,18 +631,6 @@ def generate_and_save_folder_banner(folderId: str) -> dict:
         print(f"❌ Error in generate_and_save_folder_banner: {str(e)}")
         return {"success": False, "error": str(e)}
 
-BLUR_VARIANCE_THRESHOLD = 40.0
-
-def is_face_sharp(face_crop, threshold=BLUR_VARIANCE_THRESHOLD):
-    try:
-        if face_crop is None or face_crop.size == 0:
-            return False
-        gray = cv2.cvtColor(face_crop, cv2.COLOR_RGB2GRAY)
-        variance = cv2.Laplacian(gray, cv2.CV_64F).var()
-        return variance >= threshold
-    except Exception:
-        return False
-
     
 EPS = 0.6
 MIN_SAMPLES = 2
@@ -914,7 +902,6 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                     if face_crop.size == 0:
                         face_crop = img[y1:y2, x1:x2]
 
-                    is_sharp_flag = is_face_sharp(face_crop)
                     # Side-face decision on original face object
                     side_flag = is_side_face(face)
  
@@ -927,7 +914,6 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                         "det_score": det_score,
                         "embedding": face.embedding,
                         "is_side": side_flag,
-                        "is_sharp": is_sharp_flag,
                     })
                 # ^ "for face in faces:" loop yaha khatam
             # ^ "for img, key in zip(imgs, keys):" loop bhi yaha khatam
@@ -957,7 +943,6 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                     "face_crop": candidate["face_crop"],
                     "det_score": candidate["det_score"],
                     "is_side": candidate["is_side"],
-                    "is_sharp": candidate["is_sharp"],
                 })
  
         if not all_embeddings:
@@ -990,22 +975,15 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                     "best_crop": metadata["face_crop"],
                     "max_score": metadata["det_score"],
                     "best_is_side": metadata["is_side"],
-                    "best_is_sharp": metadata["is_sharp"],
                 }
  
             if metadata["key"] not in cluster_groups[current_group_id]["images"]:
                 cluster_groups[current_group_id]["images"].append(metadata["key"])
  
-            current_best = cluster_groups[current_group_id]
-            is_better_dp = (
-                (metadata["is_sharp"] and not current_best["best_is_sharp"]) or
-                (metadata["is_sharp"] == current_best["best_is_sharp"] and metadata["det_score"] > current_best["max_score"])
-            )
-            if is_better_dp:
-                current_best["best_crop"] = metadata["face_crop"]
-                current_best["max_score"] = metadata["det_score"]
-                current_best["best_is_side"] = metadata["is_side"]
-                current_best["best_is_sharp"] = metadata["is_sharp"]
+            if metadata["det_score"] > cluster_groups[current_group_id]["max_score"]:
+                cluster_groups[current_group_id]["best_crop"] = metadata["face_crop"]
+                cluster_groups[current_group_id]["max_score"] = metadata["det_score"]
+                cluster_groups[current_group_id]["best_is_side"] = metadata["is_side"]
  
         # =========================================================
         # STAGE 3: TAGGING & SIDE-FACE CLEANUP (EXACT SCHEMA MATCH)
