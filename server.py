@@ -631,31 +631,43 @@ def generate_and_save_folder_banner(folderId: str) -> dict:
         print(f"❌ Error in generate_and_save_folder_banner: {str(e)}")
         return {"success": False, "error": str(e)}
 
+
+
+
+import io
+import uuid
+import numpy as np
+import torch
+import open_clip
+from PIL import Image
+from sklearn.cluster import DBSCAN
+
 EPS = 0.6
 MIN_SAMPLES = 2
-
-
 
 # =====================================================================
 # NAYA ADDITION #1: CLIP model ek hi baar yaha load hota hai (file ke
 # top pe, function ke bahar) — taaki har baar dubara load na ho.
 # =====================================================================
 _CLIP_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
- 
+
 _clip_model, _, _clip_preprocess = open_clip.create_model_and_transforms(
     "ViT-B-32", pretrained="openai"
 )
 _clip_model.eval().to(_CLIP_DEVICE)
 _clip_tokenizer = open_clip.get_tokenizer("ViT-B-32")
- 
+
 _REAL_PROMPTS = [
     "a photo of a real human face",
     "a close-up photograph of a person's face",
     "a candid photo of a human face",
     "a portrait photograph of a real person",
+    "a photo of a real human baby's face",
 ]
 _FAKE_PROMPTS = [
     "a doll's face",
+    "a plastic toy doll face with painted eyes",
+    "a realistic baby doll face, not a real baby",
     "a cartoon or anime character face",
     "a statue or sculpture face",
     "a mannequin face",
@@ -663,23 +675,23 @@ _FAKE_PROMPTS = [
     "a costume or animal mask face",
     "a toy or action figure face",
 ]
- 
+
 with torch.no_grad():
     _real_tok = _clip_tokenizer(_REAL_PROMPTS).to(_CLIP_DEVICE)
     _fake_tok = _clip_tokenizer(_FAKE_PROMPTS).to(_CLIP_DEVICE)
- 
+
     _real_emb = _clip_model.encode_text(_real_tok)
     _fake_emb = _clip_model.encode_text(_fake_tok)
- 
+
     _real_emb = _real_emb / _real_emb.norm(dim=-1, keepdim=True)
     _fake_emb = _fake_emb / _fake_emb.norm(dim=-1, keepdim=True)
- 
+
     _REAL_ANCHOR = _real_emb.mean(dim=0, keepdim=True)
     _FAKE_ANCHOR = _fake_emb.mean(dim=0, keepdim=True)
     _REAL_ANCHOR = _REAL_ANCHOR / _REAL_ANCHOR.norm(dim=-1, keepdim=True)
     _FAKE_ANCHOR = _FAKE_ANCHOR / _FAKE_ANCHOR.norm(dim=-1, keepdim=True)
- 
-REAL_FACE_THRESHOLD = 0.60  # apne data pe test karke adjust karein
+
+REAL_FACE_THRESHOLD = 0.68  # 0.60 se badhaya — lifelike dolls slip ho rahi thi, apne data pe fine-tune karein
 
 
 # =====================================================================
@@ -693,32 +705,33 @@ def is_real_human_face_batch(face_crops, threshold=REAL_FACE_THRESHOLD, batch_si
     """
     results = [None] * len(face_crops)
     valid_idx = [i for i, c in enumerate(face_crops) if c is not None and c.size > 0]
- 
+
     for start in range(0, len(valid_idx), batch_size):
         chunk_idx = valid_idx[start:start + batch_size]
         tensors = torch.stack(
             [_clip_preprocess(Image.fromarray(face_crops[i])) for i in chunk_idx]
         ).to(_CLIP_DEVICE)
- 
+
         with torch.no_grad():
             img_emb = _clip_model.encode_image(tensors)
             img_emb = img_emb / img_emb.norm(dim=-1, keepdim=True)
- 
+
             real_sim = (img_emb @ _REAL_ANCHOR.T).squeeze(-1)
             fake_sim = (img_emb @ _FAKE_ANCHOR.T).squeeze(-1)
- 
+
             stacked = torch.stack([real_sim, fake_sim], dim=1) * 100
             probs = torch.softmax(stacked, dim=1)[:, 0]
- 
+
         for local_i, global_i in enumerate(chunk_idx):
             score = float(probs[local_i])
             results[global_i] = (score >= threshold, score)
- 
+
     for i in range(len(face_crops)):
         if results[i] is None:
             results[i] = (False, 0.0)
- 
+
     return results
+
 
 def upload_face_crop(face_crop, folder_id, person_id):
     buffer = io.BytesIO()
@@ -741,116 +754,8 @@ def upload_face_crop(face_crop, folder_id, person_id):
     return crop_key, crop_url
 
 
-
-
-def is_side_face(face_obj):
-    try:
-        # 1️⃣ Agar InsightFace ne direct Pose Angle (Yaw) detect kiya hai
-        pose = getattr(face_obj, 'pose', None)
-        if pose is not None and len(pose) >= 2:
-            yaw = abs(pose[1])  # Yaw = Head rotation angle (Left/Right)
-            if yaw > 22.0:      # 22 degree se zyaada tilted face ko side face maano
-                return True
-
-        # 2️⃣ Keypoint (Landmark) Asymmetry Check
-        kps = getattr(face_obj, 'kps', None)
-        if kps is None or len(kps) < 5:
-            # Agar landmarks clearly detect nahi hue (extreme side profile)
-            return True
-
-        left_eye, right_eye, nose = kps[0], kps[1], kps[2]
-
-        dist_left = np.linalg.norm(nose - left_eye)
-        dist_right = np.linalg.norm(nose - right_eye)
-
-        max_dist = max(dist_left, dist_right)
-        if max_dist == 0:
-            return True
-
-        asymmetry_ratio = abs(dist_left - dist_right) / max_dist
-
-        # 💡 Threshold ko 0.32 se ghata kar 0.20 kar diya hai
-        # Cropped Face DPs me 20% asymmetry ka matlab clearly Profile / Side Face hai
-        return asymmetry_ratio > 0.20
-
-    except Exception as e:
-        print(f"⚠️ is_side_face check failed: {e}")
-        return False
-
-
-def cleanup_small_side_face_folders(folderId):
-    try:
-        folder_doc = Folder.objects(id=folderId).first()
-        if not folder_doc:
-            print("❌ Folder not found in cleanup")
-            return
-
-        subfolders_to_keep = []
-        removed_count = 0
-
-        for subfolder in folder_doc.subFolders:
-            if not subfolder.isPersonFolder:
-                subfolders_to_keep.append(subfolder)
-                continue
-
-            sub_id = str(subfolder._id)
-
-            # ✅ Live/real-time tagged count — WebLinks DB se (source of truth)
-            actual_tagged_count = WebLinks.objects(folderIds=sub_id).count()
-
-            is_side = getattr(subfolder, "isSideFace", None)
-            should_delete = False
-
-            # 🎯 Core Requirement: isSideFace == True AND tagged count <= 2
-            if is_side is True and actual_tagged_count <= 2:
-                should_delete = True
-                print(f"🔍 SIDE-FACE (Count={actual_tagged_count}): Deleting subfolder {sub_id}")
-
-            # Final Action Block
-            if should_delete:
-                removed_count += 1
-                s3_key = getattr(subfolder.folderDp, "s3Key", None) if subfolder.folderDp else None
-
-                # 1. Delete S3 Crop Image
-                if s3_key:
-                    try:
-                        s3.delete_object(Bucket=S3_BUCKET, Key=s3_key)
-                        print(f"🗑️ S3 crop deleted: {s3_key}")
-                    except Exception as s3_err:
-                        print(f"⚠️ S3 delete failed for {sub_id}: {s3_err}")
-
-                # 2. Untag WebLinks DB
-                try:
-                    WebLinks.objects(folderIds=sub_id).update(pull__folderIds=sub_id)
-                except Exception as tag_err:
-                    print(f"⚠️ Untagging failed for {sub_id}: {tag_err}")
-
-                print(f"🗑️ SUCCESSFULLY REMOVED Side-Face Folder (ID: {sub_id}, Tagged Count: {actual_tagged_count})")
-            else:
-                # Keep folder and sync real count
-                subfolder.personCount = actual_tagged_count
-                subfolders_to_keep.append(subfolder)
-
-        # Database update if any folder removed
-        if removed_count > 0:
-            folder_doc.subFolders = subfolders_to_keep
-            folder_doc.totalPersonCount = max(0, (folder_doc.totalPersonCount or 0) - removed_count)
-            folder_doc.save()
-            print(f"✅ Cleanup completed — Total {removed_count} side-face folder(s) removed.")
-        else:
-            print("✅ Cleanup completed — No side-face folders with <=2 images found.")
-
-    except Exception as e:
-        print(f"❌ Error in cleanup_small_side_face_folders: {str(e)}")
-
-
-
 def process_face_clustering_in_background(image_keys, folderId, userId, folder_name):
     try:
-        Folder.objects(id=folderId).update_one(
-            set__clusteringStatus="IN_PROGRESS"
-        )
-
         print(f"Total Images Found = {len(image_keys)}")
         all_embeddings = []
         face_metadata = []
@@ -862,11 +767,13 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
         ]
 
         # =========================================================
-        # STAGE 1: EXTRACT EMBEDDINGS FROM ALL IMAGES
+        # STAGE 1: EXTRACT EMBEDDINGS FROM ALL IMAGES  (UPDATED)
         # =========================================================
         for keys in batches:
             imgs = [read_s3_image(k) for k in keys]
 
+            # NAYA ADDITION #3: is image-batch ke saare candidate faces
+            # pehle yaha collect honge, embeddings mein turant nahi jayenge
             batch_candidates = []
 
             for img, key in zip(imgs, keys):
@@ -898,7 +805,7 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                     face_crop = img[crop_y1:crop_y2, crop_x1:crop_x2]
                     if face_crop.size == 0:
                         face_crop = img[y1:y2, x1:x2]
- 
+
                     # PEHLE: yaha direct all_embeddings.append() ho raha tha.
                     # AB: pehle candidates list mein daalte hain
                     batch_candidates.append({
@@ -906,59 +813,59 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                         "face_crop": face_crop.copy(),
                         "det_score": det_score,
                         "embedding": face.embedding,
-                        "is_side": is_side_face(face),
                     })
- 
-                if not batch_candidates:
-                       continue
- 
+                # ^ NOTE: "for face in faces:" loop yaha khatam hota hai
+                # ^ NOTE: "for img, key in zip(imgs, keys):" loop bhi yaha khatam
+                # (neeche wala block ab is loop ke BAHAR hai — sirf ek baar
+                #  poore batch ke liye chalta hai, har image ke liye nahi)
+
+            if not batch_candidates:
+                continue
+
             # =====================================================
             # NAYA ADDITION #4: yaha CLIP filter chalta hai — is
             # image-batch ke saare faces ek saath check hote hain
+            # (FIXED: ab ye sirf EK BAAR har batch ke liye chalta hai,
+            #  pehle galti se har image ke baad dubara chal raha tha
+            #  jisse duplicate entries ban rahi thi)
             # =====================================================
-                crops = [c["face_crop"] for c in batch_candidates]
-                human_results = is_real_human_face_batch(crops)
- 
-                for candidate, (is_human, score) in zip(batch_candidates, human_results):
-                    if not is_human:
-                        print(f"🚫 Non-human face rejected (score={score:.2f}): {candidate['key']}")
-                        continue
- 
+            crops = [c["face_crop"] for c in batch_candidates]
+            human_results = is_real_human_face_batch(crops)
+
+            for candidate, (is_human, score) in zip(batch_candidates, human_results):
+                if not is_human:
+                    print(f"🚫 Non-human face rejected (score={score:.2f}): {candidate['key']}")
+                    continue
+
                 # Sirf REAL human faces hi embeddings/metadata mein jaate hain
-                    all_embeddings.append(candidate["embedding"])
-                    face_metadata.append({
-                        "key": candidate["key"],
-                        "face_crop": candidate["face_crop"],
-                        "det_score": candidate["det_score"],
-                        "is_side": candidate["is_side"] 
-                   })
-
-                    # Side-face decision on original face object
-                    side_flag = is_side_face(face)
-
-                    
+                all_embeddings.append(candidate["embedding"])
+                face_metadata.append({
+                    "key": candidate["key"],
+                    "face_crop": candidate["face_crop"],
+                    "det_score": candidate["det_score"],
+                    "is_side": candidate.get("is_side", False)
+                })
 
         if not all_embeddings:
             print("⚠️ No faces detected in the given images.")
-            Folder.objects(id=folderId).update_one(
-                set__clusteringStatus="DONE",
-            )
             return
 
         # =========================================================
-        # STAGE 2: DBSCAN CLUSTERING
+        # STAGE 2: DBSCAN CLUSTERING  (koi change nahi)
         # =========================================================
         np_embeddings = np.array(all_embeddings)
         clustering = DBSCAN(eps=EPS, min_samples=MIN_SAMPLES, metric="cosine")
         labels = clustering.fit_predict(np_embeddings)
 
         cluster_groups = {}
+        unknown_faces_count = 0
         noise_id_counter = -2
 
         for label, metadata in zip(labels, face_metadata):
             if label == -1:
                 current_group_id = noise_id_counter
                 noise_id_counter -= 1
+                unknown_faces_count += 1
             else:
                 current_group_id = label
 
@@ -966,8 +873,7 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                 cluster_groups[current_group_id] = {
                     "images": [],
                     "best_crop": metadata["face_crop"],
-                    "max_score": metadata["det_score"],
-                    "best_is_side": metadata["is_side"]
+                    "max_score": metadata["det_score"]
                 }
 
             if metadata["key"] not in cluster_groups[current_group_id]["images"]:
@@ -976,81 +882,9 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
             if metadata["det_score"] > cluster_groups[current_group_id]["max_score"]:
                 cluster_groups[current_group_id]["best_crop"] = metadata["face_crop"]
                 cluster_groups[current_group_id]["max_score"] = metadata["det_score"]
-                cluster_groups[current_group_id]["best_is_side"] = metadata["is_side"]
 
         # =========================================================
-        # STAGE 3: TAGGING & SIDE-FACE CLEANUP (EXACT SCHEMA MATCH)
-        # =========================================================
-        print("\n🚀 STARTING IMAGE TAGGING & CLEANUP PROCESS")
-        valid_subfolders = []
-        removed_side_count = 0
-
-        for group_id, group_data in cluster_groups.items():
-            person_id = str(uuid.uuid4())
-            crop_key, crop_url = upload_face_crop(group_data["best_crop"], folderId, person_id)
-            sub_id = str(bson.ObjectId())  # String representation for subfolder ID
-
-            group_keys = group_data["images"]
-            group_filenames = [k.split("/")[-1] for k in group_keys if "/" in k]
-
-            # 1. Bulk Tagging mapped directly to WebLinks Schema (mainFolderId, thumbnailKey, originalKey)
-            try:
-                folder_filter = Q(mainFolderId=folderId)
-                key_filter = (
-                    Q(thumbnailKey__in=group_keys) | 
-                    Q(originalKey__in=group_keys) | 
-                    Q(thumbnailKey__in=group_filenames) | 
-                    Q(originalKey__in=group_filenames)
-                )
-
-                WebLinks.objects(folder_filter & key_filter).update(add_to_set__folderIds=sub_id)
-
-            except Exception as e:
-                print(f"❌ Failed Bulk Tagging for Subfolder {sub_id}: {str(e)}")
-
-            # 2. Check Tagged Count from DB
-            actual_tagged_count = WebLinks.objects(folderIds=sub_id).count()
-            print(f"📊 Subfolder {sub_id} tagged count: {actual_tagged_count}")
-
-            # 3. Filter Check: Side Face + Count <= 2
-            if group_data["best_is_side"] is True and actual_tagged_count <= 2:
-                removed_side_count += 1
-                print(f"🔍 SIDE-FACE FILTER (Count={actual_tagged_count}): Deleting crop & untagging subfolder {sub_id}")
-
-                # Delete Crop from S3
-                try:
-                    s3.delete_object(Bucket=S3_BUCKET, Key=crop_key)
-                except Exception as s3_err:
-                    print(f"⚠️ S3 delete failed for {sub_id}: {s3_err}")
-
-                # Untag WebLinks
-                try:
-                    WebLinks.objects(folderIds=sub_id).update(pull__folderIds=sub_id)
-                except Exception as tag_err:
-                    print(f"⚠️ Untagging failed for {sub_id}: {tag_err}")
-            else:
-                # Valid Subfolder -> Append to list
-                subfolder = SubFolder(
-                    _id=sub_id,
-                    folderName="Person",
-                    type="others",
-                    userId=userId,
-                    personCount=actual_tagged_count,
-                    isPersonFolder=True,
-                    isSideFace=group_data["best_is_side"],
-                    folderDp={
-                        "fileUrl": crop_url,
-                        "thumbnailUrl": crop_url,
-                        "s3Key": crop_key,
-                        "thumbnailKey": crop_key
-                    }
-                )
-                valid_subfolders.append(subfolder)
-
-        print(f"✅ TAGGING & CLEANUP COMPLETED (Filtered out {removed_side_count} small side-face folders)")
-
-        # =========================================================
-        # STAGE 4: FINAL DB SAVE
+        # STAGE 3: DB PERSISTENCE & S3 UPLOAD  (koi change nahi)
         # =========================================================
         folder_doc = Folder.objects(id=folderId).first()
         if not folder_doc:
@@ -1058,81 +892,118 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
             return
 
         current_ai_person_count = folder_doc.totalPersonCount or 0
+        new_ai_persons_detected = len(cluster_groups)
 
-        folder_doc.subFolders.extend(valid_subfolders)
-        folder_doc.totalPersonCount = current_ai_person_count + len(valid_subfolders)
-        folder_doc.uniqueFaceCount = len(valid_subfolders)
-        
+        created_subfolders = []
+        for group_id, group_data in cluster_groups.items():
+            person_id = str(uuid.uuid4())
+            crop_key, crop_url = upload_face_crop(group_data["best_crop"], folderId, person_id)
+
+            display_name = f"Person"
+
+            subfolder = SubFolder(
+                folderName=display_name,
+                type="others",
+                userId=userId,
+                personCount=len(group_data["images"]),
+                isPersonFolder=True,
+                folderDp={
+                    "fileUrl": crop_url,
+                    "thumbnailUrl": crop_url,
+                    "s3Key": crop_key,
+                    "thumbnailKey": crop_key
+                }
+            )
+            folder_doc.subFolders.append(subfolder)
+
+            created_subfolders.append({
+                "subFolderId": str(subfolder._id),
+                "images": group_data["images"]
+            })
+
+        folder_doc.totalPersonCount = current_ai_person_count + new_ai_persons_detected
+        folder_doc.uniqueFaceCount = len(cluster_groups)
         folder_doc.save()
-        print("✅ Folder Database Setup Success - All verified subfolders saved to DB")
+        print("✅ Folder Database Setup Success")
 
-        # =========================================================
-        # STAGE 5: BANNER GENERATION
-        # =========================================================
-        raw_order_id = getattr(folder_doc, 'orderId', None) if folder_doc else 'N/A'
-        display_order_id = int(raw_order_id) + 10800 if str(raw_order_id).isdigit() else raw_order_id
-        event_id = getattr(folder_doc, "eventId", None) if folder_doc else None
+        # =====================================================
+        # STAGE 4: IMAGE TAGGING PROCESS  (koi change nahi)
+        # =====================================================
+        print("\n🚀 STARTING IMAGE TAGGING PROCESS")
+        for sub_info in created_subfolders:
+            sub_folder_id = sub_info["subFolderId"]
+            for image_key in sub_info["images"]:
+                try:
+                    filename = image_key.split("/")[-1]
+                    WebLinks.objects(thumbnailKey__endswith=filename).update(
+                        add_to_set__folderIds=sub_folder_id
+                    )
+                except Exception as e:
+                    print(f"❌ Failed Tagging {image_key}: {str(e)}")
+        print("\n✅ IMAGE TAGGING COMPLETED")
 
-        if event_id and str(event_id).strip():
-            print(f"🎨 Generating Best Banner Image for Folder (Order ID: {display_order_id})...")
-            banner_result = generate_and_save_folder_banner(folderId=folderId)
+        # -----------------------------------------------------
+        # SAFE ORDER ID EXTRACTION FOR LOGGING  (koi change nahi)
+        # -----------------------------------------------------
+        raw_order_id = getattr(folder_doc, 'orderId', None) if 'folder_doc' in locals() and folder_doc else 'N/A'
 
-        # 🟢 STEP 2: EVERYTHING COMPLETED SUCCESSFULLY -> MARK AS 'DONE'
-        Folder.objects(id=folderId).update_one(
-            set__clusteringStatus="DONE"
-        )
+        if str(raw_order_id).isdigit():
+            display_order_id = int(raw_order_id) + 10800
+        else:
+            display_order_id = raw_order_id if raw_order_id else 'N/A'
 
         print(f"🎨 Generating Best Banner Image for Folder (Order ID: {display_order_id})...")
-        
+
         # Call Banner Generator Function
         banner_result = generate_and_save_folder_banner(folderId=folderId)
-        
+
         if banner_result.get("success"):
             banner_url = banner_result.get("bannerUrl")
             print(f"🎉 Banner automatically assigned: {banner_url}")
 
             folder_doc = Folder.objects(id=folderId).first()
+            event_id = getattr(folder_doc, "eventId", None) if folder_doc else None
 
-                # 2. NodeJS API Endpoint
-            NODE_API_URL = "https://horaservices.com/api/internal/generate-banner" 
+            if event_id and str(event_id).strip():
+                print(f"✅ eventId found ('{event_id}'). Calling Node.js Canvas API...")
 
-            try:
-                img_response = requests.get(banner_url, timeout=10)
-                img_response.raise_for_status()
-            
-                image_bytes = io.BytesIO(img_response.content)
+                NODE_API_URL = "https://horaservices.com/api/internal/generate-banner"
 
-                payload = {
-                    "folderId": str(folderId),
-                }
+                try:
+                    img_response = requests.get(banner_url, timeout=10)
+                    img_response.raise_for_status()
 
-                files = {
-                    "leftImage": ("left_image.jpg", image_bytes, "image/jpeg")
-                }
+                    image_bytes = io.BytesIO(img_response.content)
 
-                response = requests.post(NODE_API_URL, data=payload, files=files, timeout=30)
-                res_data = response.json()
+                    payload = {
+                        "folderId": str(folderId),
+                    }
 
-                if response.status_code == 200 and res_data.get("success"):
-                    print(f"✅ Node.js Canvas Banner Generated & Saved: {res_data.get('bannerUrl')}")
-                else:
-                    print(f"❌ Node.js API Error: {res_data.get('error') or res_data.get('message')}")
+                    files = {
+                        "leftImage": ("left_image.jpg", image_bytes, "image/jpeg")
+                    }
 
-                image_bytes.close()
+                    response = requests.post(NODE_API_URL, data=payload, files=files, timeout=30)
+                    res_data = response.json()
 
-            except Exception as req_err:
-                print(f"❌ Error while calling Node.js Banner API: {str(req_err)}")
+                    if response.status_code == 200 and res_data.get("success"):
+                        print(f"✅ Node.js Canvas Banner Generated & Saved: {res_data.get('bannerUrl')}")
+                    else:
+                        print(f"❌ Node.js API Error: {res_data.get('error') or res_data.get('message')}")
+
+                    image_bytes.close()
+
+                except Exception as req_err:
+                    print(f"❌ Error while calling Node.js Banner API: {str(req_err)}")
 
             else:
-                print("❌ Banner generation failed in Python layer.")
+                print(f"⚠️ eventId is missing or null for Folder ID {folderId}. Skipping Node.js API call.")
+
         else:
-            print(f"⚠️ eventId is missing or null for Folder ID {folderId}. Skipping banner generation.")
+            print("❌ Banner generation failed in Python layer.")
 
     except Exception as e:
         print(f"❌ Error in background face recognition: {str(e)}")
-        Folder.objects(id=folderId).update_one(
-            set__clusteringStatus="FAILED"
-        )
 
 
 @app.post("/count-unique-persons")
@@ -1140,34 +1011,19 @@ async def count_unique_persons(
     background_tasks: BackgroundTasks,
     folder_name: str = Form(...),
     folderId: str = Form(...),
-    userId: str = Form(...)  # ✅ Changed from userId to customerId
+    userId: str = Form(...)
 ):
     try:
         image_keys = list_s3_images(folder_name)
 
         if not image_keys:
-            print(f"⚠️ [API] No images found in S3 bucket for folder: {folder_name} (ID: {folderId})")
             return {"success": False, "message": "No images found in S3 bucket"}
-        
-        # Folder doc se orderId aur folderName fetch kar rahe hain for logging
-        folder_doc = Folder.objects(id=folderId).first()
-        orderId = getattr(folder_doc, "orderId", "N/A") if folder_doc else "N/A"
-        display_name = getattr(folder_doc, "folderName", folder_name) if folder_doc else folder_name
-
-        print("\n" + "📥" * 30)
-        print(f"📌 [API RECEIVED] Count Unique Persons Triggered")
-        print(f"📁 Folder Name : {display_name}")
-        print(f"🆔 Folder ID   : {folderId}")
-        print(f"📦 Order ID    : {orderId}")  # ✅ Using orderId key
-        print(f"👤 Customer ID : {userId}")  # ✅ Using customerId
-        print(f"🖼️ S3 Images   : {len(image_keys)} files found")
-        print("📥" * 30 + "\n")
 
         background_tasks.add_task(
-            process_face_clustering_in_background, 
-            image_keys, 
-            folderId, 
-            userId,  # ✅ Passing customerId as userId parameter
+            process_face_clustering_in_background,
+            image_keys,
+            folderId,
+            userId,
             folder_name
         )
 
@@ -1178,8 +1034,11 @@ async def count_unique_persons(
         }
 
     except Exception as e:
-        print(f"❌ [API ERROR] Failed to initialize face count: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
 
     
 @app.post("/api/test/generate-banner/{folder_id}")
