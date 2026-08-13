@@ -44,6 +44,9 @@ class SubFolder(EmbeddedDocument):
         required=True
     )
 
+
+    embedding = ListField(FloatField())
+
     isSideFace = BooleanField(default=None, null=True)
 
     personCount = IntField(default=0)
@@ -119,6 +122,9 @@ class Folder(Document):
     folderName = StringField(
         required=True
     )
+
+    uniqueFaceCount = IntField(default=0)   # 🆕 ADD THIS LINE
+
 
     viewedBy = DynamicField()
 

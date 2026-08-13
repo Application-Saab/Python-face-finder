@@ -631,6 +631,8 @@ def generate_and_save_folder_banner(folderId: str) -> dict:
 
 EPS = 0.6
 MIN_SAMPLES = 2
+MERGE_THRESHOLD = 0.42  # cosine distance — isse kam matlab same person (existing subfolder ke saath merge)
+
 
 def upload_face_crop(face_crop, folder_id, person_id):
     buffer = io.BytesIO()
@@ -653,21 +655,16 @@ def upload_face_crop(face_crop, folder_id, person_id):
     return crop_key, crop_url
 
 
-
-
 def is_side_face(face_obj):
     try:
-        # 1️⃣ Agar InsightFace ne direct Pose Angle (Yaw) detect kiya hai
         pose = getattr(face_obj, 'pose', None)
         if pose is not None and len(pose) >= 2:
-            yaw = abs(pose[1])  # Yaw = Head rotation angle (Left/Right)
-            if yaw > 22.0:      # 22 degree se zyaada tilted face ko side face maano
+            yaw = abs(pose[1])
+            if yaw > 22.0:
                 return True
 
-        # 2️⃣ Keypoint (Landmark) Asymmetry Check
         kps = getattr(face_obj, 'kps', None)
         if kps is None or len(kps) < 5:
-            # Agar landmarks clearly detect nahi hue (extreme side profile)
             return True
 
         left_eye, right_eye, nose = kps[0], kps[1], kps[2]
@@ -680,14 +677,43 @@ def is_side_face(face_obj):
             return True
 
         asymmetry_ratio = abs(dist_left - dist_right) / max_dist
-
-        # 💡 Threshold ko 0.32 se ghata kar 0.20 kar diya hai
-        # Cropped Face DPs me 20% asymmetry ka matlab clearly Profile / Side Face hai
         return asymmetry_ratio > 0.20
 
     except Exception as e:
         print(f"⚠️ is_side_face check failed: {e}")
         return False
+
+
+def find_matching_person(new_embedding, existing_people):
+    """
+    new_embedding: 1D np.array (naye cluster ka best embedding)
+    existing_people: list of {"sub_id": str, "embedding": np.array}
+    Returns matched sub_id agar koi existing person match kare, warna None
+    """
+    if not existing_people or new_embedding is None:
+        return None
+
+    best_sub_id = None
+    best_dist = float("inf")
+
+    new_vec = new_embedding / (np.linalg.norm(new_embedding) + 1e-8)
+
+    for person in existing_people:
+        existing_vec = person["embedding"]
+        if existing_vec is None or len(existing_vec) == 0:
+            continue
+        existing_vec = existing_vec / (np.linalg.norm(existing_vec) + 1e-8)
+        cosine_dist = 1 - np.dot(new_vec, existing_vec)
+
+        if cosine_dist < best_dist:
+            best_dist = cosine_dist
+            best_sub_id = person["sub_id"]
+
+    if best_dist <= MERGE_THRESHOLD:
+        print(f"🔗 Match found -> sub_id={best_sub_id} (distance={round(best_dist, 4)})")
+        return best_sub_id
+
+    return None
 
 
 def cleanup_small_side_face_folders(folderId):
@@ -706,24 +732,19 @@ def cleanup_small_side_face_folders(folderId):
                 continue
 
             sub_id = str(subfolder._id)
-
-            # ✅ Live/real-time tagged count — WebLinks DB se (source of truth)
             actual_tagged_count = WebLinks.objects(folderIds=sub_id).count()
 
             is_side = getattr(subfolder, "isSideFace", None)
             should_delete = False
 
-            # 🎯 Core Requirement: isSideFace == True AND tagged count <= 2
             if is_side is True and actual_tagged_count <= 2:
                 should_delete = True
                 print(f"🔍 SIDE-FACE (Count={actual_tagged_count}): Deleting subfolder {sub_id}")
 
-            # Final Action Block
             if should_delete:
                 removed_count += 1
                 s3_key = getattr(subfolder.folderDp, "s3Key", None) if subfolder.folderDp else None
 
-                # 1. Delete S3 Crop Image
                 if s3_key:
                     try:
                         s3.delete_object(Bucket=S3_BUCKET, Key=s3_key)
@@ -731,7 +752,6 @@ def cleanup_small_side_face_folders(folderId):
                     except Exception as s3_err:
                         print(f"⚠️ S3 delete failed for {sub_id}: {s3_err}")
 
-                # 2. Untag WebLinks DB
                 try:
                     WebLinks.objects(folderIds=sub_id).update(pull__folderIds=sub_id)
                 except Exception as tag_err:
@@ -739,11 +759,9 @@ def cleanup_small_side_face_folders(folderId):
 
                 print(f"🗑️ SUCCESSFULLY REMOVED Side-Face Folder (ID: {sub_id}, Tagged Count: {actual_tagged_count})")
             else:
-                # Keep folder and sync real count
                 subfolder.personCount = actual_tagged_count
                 subfolders_to_keep.append(subfolder)
 
-        # Database update if any folder removed
         if removed_count > 0:
             folder_doc.subFolders = subfolders_to_keep
             folder_doc.totalPersonCount = max(0, (folder_doc.totalPersonCount or 0) - removed_count)
@@ -754,7 +772,6 @@ def cleanup_small_side_face_folders(folderId):
 
     except Exception as e:
         print(f"❌ Error in cleanup_small_side_face_folders: {str(e)}")
-
 
 
 def process_face_clustering_in_background(image_keys, folderId, userId, folder_name):
@@ -807,7 +824,6 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                     crop_y2 = min(h, y2 + pad_y)
                     face_crop = img[crop_y1:crop_y2, crop_x1:crop_x2]
 
-                    # Side-face decision on original face object
                     side_flag = is_side_face(face)
 
                     all_embeddings.append(face.embedding)
@@ -815,7 +831,8 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                         "key": key,
                         "face_crop": face_crop.copy() if face_crop.size > 0 else img[y1:y2, x1:x2],
                         "det_score": det_score,
-                        "is_side": side_flag
+                        "is_side": side_flag,
+                        "embedding": face.embedding   # 🆕 stored for matching later
                     })
 
         if not all_embeddings:
@@ -826,7 +843,7 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
             return
 
         # =========================================================
-        # STAGE 2: DBSCAN CLUSTERING
+        # STAGE 2: DBSCAN CLUSTERING (within this run's images)
         # =========================================================
         np_embeddings = np.array(all_embeddings)
         clustering = DBSCAN(eps=EPS, min_samples=MIN_SAMPLES, metric="cosine")
@@ -846,6 +863,7 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                 cluster_groups[current_group_id] = {
                     "images": [],
                     "best_crop": metadata["face_crop"],
+                    "best_embedding": metadata["embedding"],   # 🆕
                     "max_score": metadata["det_score"],
                     "best_is_side": metadata["is_side"]
                 }
@@ -855,61 +873,102 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
 
             if metadata["det_score"] > cluster_groups[current_group_id]["max_score"]:
                 cluster_groups[current_group_id]["best_crop"] = metadata["face_crop"]
+                cluster_groups[current_group_id]["best_embedding"] = metadata["embedding"]   # 🆕
                 cluster_groups[current_group_id]["max_score"] = metadata["det_score"]
                 cluster_groups[current_group_id]["best_is_side"] = metadata["is_side"]
 
         # =========================================================
-        # STAGE 3: TAGGING & SIDE-FACE CLEANUP (EXACT SCHEMA MATCH)
+        # STAGE 3: TAGGING & SIDE-FACE CLEANUP (WITH CROSS-RUN MATCHING)
         # =========================================================
         print("\n🚀 STARTING IMAGE TAGGING & CLEANUP PROCESS")
         valid_subfolders = []
         removed_side_count = 0
+        merged_count = 0
+
+        # 🆕 Existing persons load karo (pehle se ban chuke subfolders ke embeddings)
+        folder_doc_for_match = Folder.objects(id=folderId).first()
+        existing_people = []
+        if folder_doc_for_match:
+            for sf in folder_doc_for_match.subFolders:
+                sf_embedding = getattr(sf, "embedding", None)
+                if getattr(sf, "isPersonFolder", False) and sf_embedding:
+                    existing_people.append({
+                        "sub_id": str(sf._id),
+                        "embedding": np.array(sf_embedding)
+                    })
+
+        print(f"🔎 {len(existing_people)} existing person(s) loaded for matching")
 
         for group_id, group_data in cluster_groups.items():
-            person_id = str(uuid.uuid4())
-            crop_key, crop_url = upload_face_crop(group_data["best_crop"], folderId, person_id)
-            sub_id = str(bson.ObjectId())  # String representation for subfolder ID
+
+            # 🆕 STEP A: Check ki ye person pehle se exist karta hai kya
+            matched_sub_id = find_matching_person(group_data["best_embedding"], existing_people)
 
             group_keys = group_data["images"]
             group_filenames = [k.split("/")[-1] for k in group_keys if "/" in k]
 
-            # 1. Bulk Tagging mapped directly to WebLinks Schema (mainFolderId, thumbnailKey, originalKey)
+            if matched_sub_id:
+                # ===================== MERGE PATH =====================
+                sub_id = matched_sub_id
+                try:
+                    folder_filter = Q(mainFolderId=folderId)
+                    key_filter = (
+                        Q(thumbnailKey__in=group_keys) |
+                        Q(originalKey__in=group_keys) |
+                        Q(thumbnailKey__in=group_filenames) |
+                        Q(originalKey__in=group_filenames)
+                    )
+                    WebLinks.objects(folder_filter & key_filter).update(add_to_set__folderIds=sub_id)
+                except Exception as e:
+                    print(f"❌ Failed Bulk Tagging (merge) for Subfolder {sub_id}: {str(e)}")
+
+                actual_tagged_count = WebLinks.objects(folderIds=sub_id).count()
+                merged_count += 1
+                print(f"🔁 MERGED into existing person {sub_id} — new tagged count: {actual_tagged_count}")
+
+                # personCount sync karo existing subfolder object me
+                if folder_doc_for_match:
+                    for sf in folder_doc_for_match.subFolders:
+                        if str(sf._id) == sub_id:
+                            sf.personCount = actual_tagged_count
+                            break
+
+                continue  # ✅ naya subfolder create nahi hoga
+
+            # ===================== CREATE PATH (naya person) =====================
+            person_id = str(uuid.uuid4())
+            crop_key, crop_url = upload_face_crop(group_data["best_crop"], folderId, person_id)
+            sub_id = str(bson.ObjectId())
+
             try:
                 folder_filter = Q(mainFolderId=folderId)
                 key_filter = (
-                    Q(thumbnailKey__in=group_keys) | 
-                    Q(originalKey__in=group_keys) | 
-                    Q(thumbnailKey__in=group_filenames) | 
+                    Q(thumbnailKey__in=group_keys) |
+                    Q(originalKey__in=group_keys) |
+                    Q(thumbnailKey__in=group_filenames) |
                     Q(originalKey__in=group_filenames)
                 )
-
                 WebLinks.objects(folder_filter & key_filter).update(add_to_set__folderIds=sub_id)
-
             except Exception as e:
                 print(f"❌ Failed Bulk Tagging for Subfolder {sub_id}: {str(e)}")
 
-            # 2. Check Tagged Count from DB
             actual_tagged_count = WebLinks.objects(folderIds=sub_id).count()
             print(f"📊 Subfolder {sub_id} tagged count: {actual_tagged_count}")
 
-            # 3. Filter Check: Side Face + Count <= 2
             if group_data["best_is_side"] is True and actual_tagged_count <= 2:
                 removed_side_count += 1
                 print(f"🔍 SIDE-FACE FILTER (Count={actual_tagged_count}): Deleting crop & untagging subfolder {sub_id}")
 
-                # Delete Crop from S3
                 try:
                     s3.delete_object(Bucket=S3_BUCKET, Key=crop_key)
                 except Exception as s3_err:
                     print(f"⚠️ S3 delete failed for {sub_id}: {s3_err}")
 
-                # Untag WebLinks
                 try:
                     WebLinks.objects(folderIds=sub_id).update(pull__folderIds=sub_id)
                 except Exception as tag_err:
                     print(f"⚠️ Untagging failed for {sub_id}: {tag_err}")
             else:
-                # Valid Subfolder -> Append to list
                 subfolder = SubFolder(
                     _id=sub_id,
                     folderName="Person",
@@ -918,6 +977,7 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                     personCount=actual_tagged_count,
                     isPersonFolder=True,
                     isSideFace=group_data["best_is_side"],
+                    embedding=list(map(float, group_data["best_embedding"])),  # 🆕 save embedding
                     folderDp={
                         "fileUrl": crop_url,
                         "thumbnailUrl": crop_url,
@@ -927,7 +987,15 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                 )
                 valid_subfolders.append(subfolder)
 
-        print(f"✅ TAGGING & CLEANUP COMPLETED (Filtered out {removed_side_count} small side-face folders)")
+                # 🆕 isi run ke andar bhi aage ke clusters isse match kar sakein
+                existing_people.append({
+                    "sub_id": sub_id,
+                    "embedding": group_data["best_embedding"]
+                })
+
+        print(f"✅ TAGGING & CLEANUP COMPLETED "
+              f"(New: {len(valid_subfolders)}, Merged: {merged_count}, "
+              f"Filtered side-face: {removed_side_count})")
 
         # =========================================================
         # STAGE 4: FINAL DB SAVE
@@ -939,10 +1007,18 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
 
         current_ai_person_count = folder_doc.totalPersonCount or 0
 
-        folder_doc.subFolders.extend(valid_subfolders)
+        folder_doc.subFolders.extend(valid_subfolders)   # sirf NAYE persons add honge
         folder_doc.totalPersonCount = current_ai_person_count + len(valid_subfolders)
-        folder_doc.uniqueFaceCount = len(valid_subfolders)
-        
+        folder_doc.uniqueFaceCount = (folder_doc.uniqueFaceCount or 0) + len(valid_subfolders)
+
+        # 🆕 Existing (merged) subfolders ka personCount bhi persist karo
+        if folder_doc_for_match:
+            updated_counts = {str(sf._id): sf.personCount for sf in folder_doc_for_match.subFolders}
+            for sf in folder_doc.subFolders:
+                sid = str(sf._id)
+                if sid in updated_counts:
+                    sf.personCount = updated_counts[sid]
+
         folder_doc.save()
         print("✅ Folder Database Setup Success - All verified subfolders saved to DB")
 
@@ -957,29 +1033,26 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
             print(f"🎨 Generating Best Banner Image for Folder (Order ID: {display_order_id})...")
             banner_result = generate_and_save_folder_banner(folderId=folderId)
 
-        # 🟢 STEP 2: EVERYTHING COMPLETED SUCCESSFULLY -> MARK AS 'DONE'
         Folder.objects(id=folderId).update_one(
             set__clusteringStatus="DONE"
         )
 
         print(f"🎨 Generating Best Banner Image for Folder (Order ID: {display_order_id})...")
-        
-        # Call Banner Generator Function
+
         banner_result = generate_and_save_folder_banner(folderId=folderId)
-        
+
         if banner_result.get("success"):
             banner_url = banner_result.get("bannerUrl")
             print(f"🎉 Banner automatically assigned: {banner_url}")
 
             folder_doc = Folder.objects(id=folderId).first()
 
-                # 2. NodeJS API Endpoint
-            NODE_API_URL = "https://horaservices.com/api/internal/generate-banner" 
+            NODE_API_URL = "https://horaservices.com/api/internal/generate-banner"
 
             try:
                 img_response = requests.get(banner_url, timeout=10)
                 img_response.raise_for_status()
-            
+
                 image_bytes = io.BytesIO(img_response.content)
 
                 payload = {
@@ -1003,8 +1076,6 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
             except Exception as req_err:
                 print(f"❌ Error while calling Node.js Banner API: {str(req_err)}")
 
-            else:
-                print("❌ Banner generation failed in Python layer.")
         else:
             print(f"⚠️ eventId is missing or null for Folder ID {folderId}. Skipping banner generation.")
 
@@ -1020,7 +1091,7 @@ async def count_unique_persons(
     background_tasks: BackgroundTasks,
     folder_name: str = Form(...),
     folderId: str = Form(...),
-    userId: str = Form(...)  # ✅ Changed from userId to customerId
+    userId: str = Form(...)
 ):
     try:
         image_keys = list_s3_images(folder_name)
@@ -1028,8 +1099,7 @@ async def count_unique_persons(
         if not image_keys:
             print(f"⚠️ [API] No images found in S3 bucket for folder: {folder_name} (ID: {folderId})")
             return {"success": False, "message": "No images found in S3 bucket"}
-        
-        # Folder doc se orderId aur folderName fetch kar rahe hain for logging
+
         folder_doc = Folder.objects(id=folderId).first()
         orderId = getattr(folder_doc, "orderId", "N/A") if folder_doc else "N/A"
         display_name = getattr(folder_doc, "folderName", folder_name) if folder_doc else folder_name
@@ -1038,16 +1108,16 @@ async def count_unique_persons(
         print(f"📌 [API RECEIVED] Count Unique Persons Triggered")
         print(f"📁 Folder Name : {display_name}")
         print(f"🆔 Folder ID   : {folderId}")
-        print(f"📦 Order ID    : {orderId}")  # ✅ Using orderId key
-        print(f"👤 Customer ID : {userId}")  # ✅ Using customerId
+        print(f"📦 Order ID    : {orderId}")
+        print(f"👤 Customer ID : {userId}")
         print(f"🖼️ S3 Images   : {len(image_keys)} files found")
         print("📥" * 30 + "\n")
 
         background_tasks.add_task(
-            process_face_clustering_in_background, 
-            image_keys, 
-            folderId, 
-            userId,  # ✅ Passing customerId as userId parameter
+            process_face_clustering_in_background,
+            image_keys,
+            folderId,
+            userId,
             folder_name
         )
 
@@ -1060,7 +1130,6 @@ async def count_unique_persons(
     except Exception as e:
         print(f"❌ [API ERROR] Failed to initialize face count: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
     
 @app.post("/api/test/generate-banner/{folder_id}")
 async def test_generate_banner_endpoint(folder_id: str):
