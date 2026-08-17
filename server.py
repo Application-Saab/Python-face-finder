@@ -977,7 +977,6 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                 cluster_groups[current_group_id]["max_score"] = metadata["det_score"]
                 cluster_groups[current_group_id]["best_is_side"] = metadata["is_side"]
 
-        # 🆕 DEBUG: batao ki is run me kitne clusters bane (within-run grouping check ke liye)
         print(f"🧩 DBSCAN se {len(cluster_groups)} cluster(s) bane is run me (EPS={EPS})")
 
         # =========================================================
@@ -1005,7 +1004,6 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
 
             representative_embedding = compute_cluster_embedding(group_data)
 
-            # 🆕 DEBUG: batao ye cluster kaunsi group_id hai aur kitni images hain
             print(f"\n--- Processing cluster group_id={group_id} | images_in_cluster={len(group_data['images'])} | is_side={group_data['best_is_side']} ---")
 
             matched_sub_id = find_matching_person(representative_embedding, existing_people)
@@ -1146,59 +1144,84 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
         # =========================================================
         # STAGE 5: BANNER GENERATION
         # =========================================================
-        raw_order_id = getattr(folder_doc, 'orderId', None) if folder_doc else 'N/A'
-        display_order_id = int(raw_order_id) + 10800 if str(raw_order_id).isdigit() else raw_order_id
-        event_id = getattr(folder_doc, "eventId", None) if folder_doc else None
+        if isLastBatch:
+            print("🎨 Last batch received, generating banner...")
 
-        if event_id and str(event_id).strip():
-            print(f"🎨 Generating Best Banner Image for Folder (Order ID: {display_order_id})...")
-            banner_result = generate_and_save_folder_banner(folderId=folderId)
+            raw_order_id = getattr(folder_doc, 'orderId', None) if folder_doc else 'N/A'
+            display_order_id = int(raw_order_id) + 10800 if str(raw_order_id).isdigit() else raw_order_id
+            event_id = getattr(folder_doc, "eventId", None) if folder_doc else None
 
-        Folder.objects(id=folderId).update_one(
-            set__clusteringStatus="DONE"
-        )
+            Folder.objects(id=folderId).update_one(
+                set__clusteringStatus="DONE"
+            )
 
-        print(f"🎨 Generating Best Banner Image for Folder (Order ID: {display_order_id})...")
+            if event_id and str(event_id).strip():
+                print(f"🎨 Generating Best Banner Image for Folder (Order ID: {display_order_id})...")
 
-        banner_result = generate_and_save_folder_banner(folderId=folderId)
+                banner_result = generate_and_save_folder_banner(folderId=folderId)
 
-        if banner_result.get("success"):
-            banner_url = banner_result.get("bannerUrl")
-            print(f"🎉 Banner automatically assigned: {banner_url}")
+                if banner_result.get("success"):
+                    banner_url = banner_result.get("bannerUrl")
+                    print(f"🎉 Banner automatically assigned: {banner_url}")
 
-            folder_doc = Folder.objects(id=folderId).first()
+                    NODE_API_URL = "https://horaservices.com/api/internal/generate-banner"
 
-            NODE_API_URL = "http://localhost:9000/api/internal/generate-banner"
+                    try:
+                        img_response = requests.get(banner_url, timeout=10)
+                        img_response.raise_for_status()
 
-            try:
-                img_response = requests.get(banner_url, timeout=10)
-                img_response.raise_for_status()
+                        image_bytes = io.BytesIO(img_response.content)
 
-                image_bytes = io.BytesIO(img_response.content)
+                        payload = {
+                            "folderId": str(folderId),
+                        }
 
-                payload = {
-                    "folderId": str(folderId),
-                }
+                        files = {
+                            "leftImage": ("left_image.jpg", image_bytes, "image/jpeg")
+                        }
 
-                files = {
-                    "leftImage": ("left_image.jpg", image_bytes, "image/jpeg")
-                }
+                        response = requests.post(
+                            NODE_API_URL,
+                            data=payload,
+                            files=files,
+                            timeout=30
+                        )
 
-                response = requests.post(NODE_API_URL, data=payload, files=files, timeout=30)
-                res_data = response.json()
+                        res_data = response.json()
 
-                if response.status_code == 200 and res_data.get("success"):
-                    print(f"✅ Node.js Canvas Banner Generated & Saved: {res_data.get('bannerUrl')}")
+                        if response.status_code == 200 and res_data.get("success"):
+                            print(
+                                f"✅ Node.js Canvas Banner Generated & Saved: "
+                                f"{res_data.get('bannerUrl')}"
+                            )
+                        else:
+                            print(
+                                f"❌ Node.js API Error: "
+                                f"{res_data.get('error') or res_data.get('message')}"
+                            )
+
+                        image_bytes.close()
+
+                    except Exception as req_err:
+                        print(
+                            f"❌ Error while calling Node.js Banner API: "
+                            f"{str(req_err)}"
+                        )
+
                 else:
-                    print(f"❌ Node.js API Error: {res_data.get('error') or res_data.get('message')}")
+                    print("⚠️ Banner generation failed")
 
-                image_bytes.close()
-
-            except Exception as req_err:
-                print(f"❌ Error while calling Node.js Banner API: {str(req_err)}")
+            else:
+                print(
+                    f"⚠️ eventId is missing or null for Folder ID {folderId}. "
+                    f"Skipping banner generation."
+                )
 
         else:
-            print(f"⚠️ eventId is missing or null for Folder ID {folderId}. Skipping banner generation.")
+            Folder.objects(id=folderId).update_one(
+                set__clusteringStatus="DONE"
+            )
+            print("⏩ Not last batch, banner generation skipped")
 
     except Exception as e:
         print(f"❌ Error in background face recognition: {str(e)}")
@@ -1301,7 +1324,7 @@ async def test_generate_banner_endpoint(folder_id: str):
 
         
 
-        NODE_API_URL = "http://localhost:9000/api/internal/generate-banner"
+        NODE_API_URL = "https://horaservices.com/api/internal/generate-banner"
 
         img_response = requests.get(banner_url, timeout=10)
         img_response.raise_for_status()
