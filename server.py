@@ -40,6 +40,8 @@ import bson
 from mongoengine.queryset.visitor import Q  
 import torch
 import open_clip
+from datetime import datetime, timedelta
+
 
 s3_client = boto3.client('s3') 
 BUCKET_NAME = "photography-hora"
@@ -634,6 +636,8 @@ def generate_and_save_folder_banner(folderId: str) -> dict:
     
 EPS = 0.6
 MIN_SAMPLES = 2
+MERGE_THRESHOLD = 0.50  
+STALE_LOCK_MINUTES = 15
  
  
 # =====================================================================
@@ -778,6 +782,139 @@ def is_side_face(face_obj):
     except Exception as e:
         print(f"⚠️ is_side_face check failed: {e}")
         return False
+
+
+def find_matching_person(new_embedding, existing_people):
+    """
+    new_embedding: 1D np.array (naye cluster ka representative embedding)
+    existing_people: list of {"sub_id": str, "embedding": np.array}
+    Returns matched sub_id agar koi existing person match kare, warna None
+    """
+    if not existing_people or new_embedding is None:
+        print("⚠️ find_matching_person: existing_people empty ya new_embedding None hai — skip")
+        return None
+
+    best_sub_id = None
+    best_dist = float("inf")
+
+    new_vec = new_embedding / (np.linalg.norm(new_embedding) + 1e-8)
+
+    # 🆕 DEBUG: har existing person ke against distance collect karo
+    all_distances = []
+
+    for person in existing_people:
+        existing_vec = person["embedding"]
+        if existing_vec is None or len(existing_vec) == 0:
+            continue
+        existing_vec = existing_vec / (np.linalg.norm(existing_vec) + 1e-8)
+        cosine_dist = 1 - np.dot(new_vec, existing_vec)
+
+        all_distances.append((person["sub_id"], round(float(cosine_dist), 4)))
+
+        if cosine_dist < best_dist:
+            best_dist = cosine_dist
+            best_sub_id = person["sub_id"]
+
+    # 🆕 DEBUG: saare distances ek line me print karo (readable format)
+    if all_distances:
+        print(f"📏 DISTANCES this cluster vs existing people -> {all_distances}")
+
+    if best_dist <= MERGE_THRESHOLD:
+        print(f"🔗 MATCH FOUND -> sub_id={best_sub_id} (distance={round(best_dist, 4)}, threshold={MERGE_THRESHOLD})")
+        return best_sub_id
+
+    # 🆕 DEBUG LOG: match fail hua toh bhi best distance print karo.
+    # Isse pata chalega ki threshold kitna badhana chahiye — bina isse
+    # hum blindly guess kar rahe the.
+    if best_sub_id is not None:
+        print(f"❌ NO MATCH (closest was sub_id={best_sub_id}, "
+              f"distance={round(best_dist, 4)}, threshold={MERGE_THRESHOLD}) "
+              f"-> naya person banega")
+
+    return None
+
+
+def compute_cluster_embedding(group_data):
+    """
+    Cluster ka final "representative" embedding nikaalta hai.
+    Is run ke cluster ke saare FRONTAL (non-side) face embeddings ka
+    MEAN nikaala jaata hai -> zyada stable representative.
+    Extra DB storage NAHI lagti, final me ek hi vector (same size) return hota hai.
+    """
+    frontal_embs = group_data.get("all_frontal_embeddings") or []
+    if len(frontal_embs) >= 1:
+        stacked = np.array(frontal_embs)
+        mean_emb = stacked.mean(axis=0)
+        return mean_emb
+    return group_data["best_embedding"]
+
+
+def update_running_centroid(old_embedding, old_count, new_embedding):
+    """
+    MERGE hone par existing person ka stored embedding "running weighted
+    average" (centroid) ki tarah update hota hai. Storage same rehta hai.
+    """
+    old_embedding = np.array(old_embedding, dtype=np.float64)
+    new_embedding = np.array(new_embedding, dtype=np.float64)
+
+    weight_old = max(1, old_count)
+    weight_new = 1
+
+    updated = (old_embedding * weight_old + new_embedding * weight_new) / (weight_old + weight_new)
+    norm = np.linalg.norm(updated)
+    if norm > 0:
+        updated = updated / norm
+    return updated
+
+
+# =========================================================
+# CONCURRENCY LOCK (folderId-specific, alag orders parallel chalte rahenge)
+# =========================================================
+def try_acquire_clustering_lock(folderId, isLastBatch=False):
+    """
+    NO SCHEMA CHANGE (mostly): 'clusteringStatus' aur 'updatedAt' se lock hota hai.
+    Naya field 'pendingLastBatch' add kiya hai taaki agar isLastBatch=True wali
+    call skip ho jaaye (kyunki dusra run chal raha tha), toh uska flag kho na jaaye.
+    """
+    now = datetime.utcnow()
+
+    result = Folder.objects(
+        id=folderId,
+        clusteringStatus__ne="IN_PROGRESS"
+    ).update_one(
+        set__clusteringStatus="IN_PROGRESS",
+        set__updatedAt=now
+    )
+
+    if result:
+        return True
+
+    # Lock nahi mila -> agar ye call isLastBatch=True thi, toh uska
+    # flag folder doc pe save kar do taaki jo run currently chal raha
+    # hai, wo baad me isko dekh kar banner generate kar sake.
+    if isLastBatch:
+        Folder.objects(id=folderId).update_one(
+            set__pendingLastBatch=True
+        )
+        print(f"📌 isLastBatch flag SAVED as pending for folder {folderId} (lock busy tha)")
+
+    folder_doc = Folder.objects(id=folderId).first()
+    if not folder_doc:
+        return False
+
+    last_updated = folder_doc.updatedAt or now
+    is_stale = (now - last_updated) > timedelta(minutes=STALE_LOCK_MINUTES)
+
+    if is_stale:
+        print(f"⚠️ STALE LOCK detected for folder {folderId}. Force-acquiring.")
+        Folder.objects(id=folderId).update_one(
+            set__clusteringStatus="IN_PROGRESS",
+            set__updatedAt=now
+        )
+        return True
+
+    print(f"⏩ SKIPPING trigger for folder {folderId} — clustering already IN_PROGRESS")
+    return False
  
  
 def cleanup_small_side_face_folders(folderId):
@@ -846,54 +983,43 @@ def cleanup_small_side_face_folders(folderId):
         print(f"❌ Error in cleanup_small_side_face_folders: {str(e)}")
  
  
-def process_face_clustering_in_background(image_keys, folderId, userId, folder_name):
+def process_face_clustering_in_background(image_keys, folderId, userId, folder_name, isLastBatch=False):
+    if not try_acquire_clustering_lock(folderId, isLastBatch):
+        print(f"⏩ Background task SKIPPED for folder {folderId} — already in progress")
+        return
     try:
-        Folder.objects(id=folderId).update_one(
-            set__clusteringStatus="IN_PROGRESS"
-        )
- 
         print(f"Total Images Found = {len(image_keys)}")
         all_embeddings = []
         face_metadata = []
- 
         BATCH_SIZE = 10
         batches = [
             image_keys[i:i + BATCH_SIZE]
             for i in range(0, len(image_keys), BATCH_SIZE)
         ]
- 
         # =========================================================
         # STAGE 1: EXTRACT EMBEDDINGS FROM ALL IMAGES
         # =========================================================
         for keys in batches:
             imgs = [read_s3_image(k) for k in keys]
- 
             # NAYA ADDITION #3: is image-batch ke saare candidate faces
             # pehle yaha collect honge, embeddings mein turant nahi jayenge
             batch_candidates = []
- 
             for img, key in zip(imgs, keys):
                 if img is None:
                     continue
- 
                 faces = searcher.app.get(img)
                 if not faces:
                     continue
- 
                 for face in faces:
                     det_score = getattr(face, 'det_score', 1.0)
                     if det_score < 0.65:
                         continue
- 
                     x1, y1, x2, y2 = map(int, face.bbox)
                     face_w, face_h = x2 - x1, y2 - y1
- 
                     if face_w < 35 or face_h < 35:
                         continue
- 
                     pad_x, pad_y = int(face_w * 0.20), int(face_h * 0.20)
                     h, w = img.shape[:2]
- 
                     crop_x1 = max(0, x1 - pad_x)
                     crop_y1 = max(0, y1 - pad_y)
                     crop_x2 = min(w, x2 + pad_x)
@@ -904,7 +1030,7 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
 
                     # Side-face decision on original face object
                     side_flag = is_side_face(face)
- 
+
                     # PEHLE: yaha direct all_embeddings.append() ho raha tha.
                     # AB: pehle candidates list mein daalte hain, taaki CLIP
                     # filter run hone ke baad hi final embeddings mein jaaye
@@ -914,28 +1040,27 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                         "det_score": det_score,
                         "embedding": face.embedding,
                         "is_side": side_flag,
+                        "embedding": face.embedding,
                     })
                 # ^ "for face in faces:" loop yaha khatam
             # ^ "for img, key in zip(imgs, keys):" loop bhi yaha khatam
             # (CLIP filter block jaan-boojh kar is loop ke BAHAR rakha hai,
             #  taaki ye sirf EK BAAR poore batch ke liye chale, har image
             #  ke baad baar-baar nahi)
- 
             if not batch_candidates:
                 continue
- 
             # =====================================================
             # NAYA ADDITION #4: yaha CLIP filter chalta hai — is
             # image-batch ke saare faces ek saath check hote hain
             # =====================================================
             crops = [c["face_crop"] for c in batch_candidates]
             human_results = is_real_human_face_batch(crops)
- 
+
             for candidate, (is_human, score) in zip(batch_candidates, human_results):
                 if not is_human:
                     print(f"🚫 Non-human face rejected (score={score:.2f}): {candidate['key']}")
                     continue
- 
+
                 # Sirf REAL human faces hi embeddings/metadata mein jaate hain
                 all_embeddings.append(candidate["embedding"])
                 face_metadata.append({
@@ -943,64 +1068,136 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                     "face_crop": candidate["face_crop"],
                     "det_score": candidate["det_score"],
                     "is_side": candidate["is_side"],
+                    "embedding": candidate["embedding"],
                 })
- 
         if not all_embeddings:
             print("⚠️ No faces detected in the given images.")
             Folder.objects(id=folderId).update_one(
                 set__clusteringStatus="DONE",
             )
             return
- 
         # =========================================================
         # STAGE 2: DBSCAN CLUSTERING
         # =========================================================
         np_embeddings = np.array(all_embeddings)
         clustering = DBSCAN(eps=EPS, min_samples=MIN_SAMPLES, metric="cosine")
         labels = clustering.fit_predict(np_embeddings)
- 
         cluster_groups = {}
         noise_id_counter = -2
- 
         for label, metadata in zip(labels, face_metadata):
             if label == -1:
                 current_group_id = noise_id_counter
                 noise_id_counter -= 1
             else:
                 current_group_id = label
- 
             if current_group_id not in cluster_groups:
+                emb = metadata["embedding"]
+
                 cluster_groups[current_group_id] = {
                     "images": [],
                     "best_crop": metadata["face_crop"],
                     "max_score": metadata["det_score"],
                     "best_is_side": metadata["is_side"],
+                    "best_embedding": emb,
+                    "all_frontal_embeddings": [] if metadata["is_side"] else [metadata["embedding"]],
                 }
- 
+
+            else:
+                if not metadata["is_side"]:
+                    cluster_groups[current_group_id]["all_frontal_embeddings"].append(metadata["embedding"])
+
             if metadata["key"] not in cluster_groups[current_group_id]["images"]:
                 cluster_groups[current_group_id]["images"].append(metadata["key"])
- 
+
             if metadata["det_score"] > cluster_groups[current_group_id]["max_score"]:
                 cluster_groups[current_group_id]["best_crop"] = metadata["face_crop"]
                 cluster_groups[current_group_id]["max_score"] = metadata["det_score"]
                 cluster_groups[current_group_id]["best_is_side"] = metadata["is_side"]
- 
+
+        print(f"🧩 DBSCAN se {len(cluster_groups)} cluster(s) bane is run me (EPS={EPS})")
+
+
         # =========================================================
-        # STAGE 3: TAGGING & SIDE-FACE CLEANUP (EXACT SCHEMA MATCH)
+        # STAGE 3: TAGGING & SIDE-FACE CLEANUP (WITH CROSS-RUN MATCHING)
         # =========================================================
         print("\n🚀 STARTING IMAGE TAGGING & CLEANUP PROCESS")
         valid_subfolders = []
         removed_side_count = 0
- 
+        merged_count = 0
+
+        # 🆕 Existing persons load karo (pehle se ban chuke subfolders ke embeddings)
+        folder_doc_for_match = Folder.objects(id=folderId).first()
+        existing_people = []
+        if folder_doc_for_match:
+            for sf in folder_doc_for_match.subFolders:
+                sf_embedding = getattr(sf, "embedding", None)
+                if getattr(sf, "isPersonFolder", False) and sf_embedding:
+                    existing_people.append({
+                        "sub_id": str(sf._id),
+                        "embedding": np.array(sf_embedding)
+                    })
+
+        print(f"🔎 {len(existing_people)} existing person(s) loaded for matching")
+
         for group_id, group_data in cluster_groups.items():
-            person_id = str(uuid.uuid4())
-            crop_key, crop_url = upload_face_crop(group_data["best_crop"], folderId, person_id)
-            sub_id = str(bson.ObjectId())  # String representation for subfolder ID
- 
+
+            representative_embedding = compute_cluster_embedding(group_data)
+
+            # 🆕 DEBUG: batao ye cluster kaunsi group_id hai aur kitni images hain
+            print(f"\n--- Processing cluster group_id={group_id} | images_in_cluster={len(group_data['images'])} | is_side={group_data['best_is_side']} ---")
+
+            matched_sub_id = find_matching_person(representative_embedding, existing_people)
+
             group_keys = group_data["images"]
             group_filenames = [k.split("/")[-1] for k in group_keys if "/" in k]
- 
-            # 1. Bulk Tagging mapped directly to WebLinks Schema (mainFolderId, thumbnailKey, originalKey)
+
+            if matched_sub_id:
+                # ===================== MERGE PATH =====================
+                sub_id = matched_sub_id
+                try:
+                    folder_filter = Q(mainFolderId=folderId)
+                    key_filter = (
+                        Q(thumbnailKey__in=group_keys) |
+                        Q(originalKey__in=group_keys) |
+                        Q(thumbnailKey__in=group_filenames) |
+                        Q(originalKey__in=group_filenames)
+                    )
+                    WebLinks.objects(folder_filter & key_filter).update(add_to_set__folderIds=sub_id)
+                except Exception as e:
+                    print(f"❌ Failed Bulk Tagging (merge) for Subfolder {sub_id}: {str(e)}")
+
+                actual_tagged_count = WebLinks.objects(folderIds=sub_id).count()
+                merged_count += 1
+                print(f"🔁 MERGED into existing person {sub_id} — new tagged count: {actual_tagged_count}")
+
+                if folder_doc_for_match:
+                    for sf in folder_doc_for_match.subFolders:
+                        if str(sf._id) == sub_id:
+                            old_person_count = sf.personCount or 1
+                            sf.personCount = actual_tagged_count
+
+                            old_emb = getattr(sf, "embedding", None)
+                            if old_emb is not None and len(old_emb) > 0:
+                                updated_emb = update_running_centroid(
+                                    old_emb,
+                                    old_person_count,
+                                    representative_embedding
+                                )
+                                sf.embedding = list(map(float, updated_emb))
+
+                                for p in existing_people:
+                                    if p["sub_id"] == sub_id:
+                                        p["embedding"] = updated_emb
+                                        break
+                            break
+
+                continue
+
+            # ===================== CREATE PATH (naya person) =====================
+            person_id = str(uuid.uuid4())
+            crop_key, crop_url = upload_face_crop(group_data["best_crop"], folderId, person_id)
+            sub_id = str(bson.ObjectId())
+
             try:
                 folder_filter = Q(mainFolderId=folderId)
                 key_filter = (
@@ -1009,9 +1206,7 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                     Q(thumbnailKey__in=group_filenames) |
                     Q(originalKey__in=group_filenames)
                 )
-
                 WebLinks.objects(folder_filter & key_filter).update(add_to_set__folderIds=sub_id)
-
             except Exception as e:
                 print(f"❌ Failed Bulk Tagging for Subfolder {sub_id}: {str(e)}")
 
@@ -1036,7 +1231,6 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                 except Exception as tag_err:
                     print(f"⚠️ Untagging failed for {sub_id}: {tag_err}")
             else:
-                # Valid Subfolder -> Append to list
                 subfolder = SubFolder(
                     _id=sub_id,
                     folderName="Person",
@@ -1045,6 +1239,7 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                     personCount=actual_tagged_count,
                     isPersonFolder=True,
                     isSideFace=group_data["best_is_side"],
+                    embedding=list(map(float, representative_embedding)),
                     folderDp={
                         "fileUrl": crop_url,
                         "thumbnailUrl": crop_url,
@@ -1054,7 +1249,15 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                 )
                 valid_subfolders.append(subfolder)
 
-        print(f"✅ TAGGING & CLEANUP COMPLETED (Filtered out {removed_side_count} small side-face folders)")
+                # 🆕 isi run ke andar bhi aage ke clusters isse match kar sakein
+                existing_people.append({
+                    "sub_id": sub_id,
+                    "embedding": representative_embedding
+                })
+
+        print(f"✅ TAGGING & CLEANUP COMPLETED "
+              f"(New: {len(valid_subfolders)}, Merged: {merged_count}, "
+              f"Filtered side-face: {removed_side_count})")
 
         # =========================================================
         # STAGE 4: FINAL DB SAVE
@@ -1068,7 +1271,19 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
 
         folder_doc.subFolders.extend(valid_subfolders)
         folder_doc.totalPersonCount = current_ai_person_count + len(valid_subfolders)
-        folder_doc.uniqueFaceCount = len(valid_subfolders)
+        folder_doc.uniqueFaceCount = (folder_doc.uniqueFaceCount or 0) + len(valid_subfolders)
+
+        # 🆕 Existing (merged) subfolders ka personCount bhi persist karo
+        if folder_doc_for_match:
+            updated_counts = {str(sf._id): sf.personCount for sf in folder_doc_for_match.subFolders}
+            updated_embeddings = {str(sf._id): getattr(sf, "embedding", None) for sf in folder_doc_for_match.subFolders}
+            for sf in folder_doc.subFolders:
+                sid = str(sf._id)
+                if sid in updated_counts:
+                    sf.personCount = updated_counts[sid]
+                if updated_embeddings.get(sid):
+                    sf.embedding = updated_embeddings[sid]
+
 
         folder_doc.save()
         print("✅ Folder Database Setup Success - All verified subfolders saved to DB")
@@ -1076,76 +1291,118 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
         # =========================================================
         # STAGE 5: BANNER GENERATION
         # =========================================================
-        raw_order_id = getattr(folder_doc, 'orderId', None) if folder_doc else 'N/A'
-        display_order_id = int(raw_order_id) + 10800 if str(raw_order_id).isdigit() else raw_order_id
-        event_id = getattr(folder_doc, "eventId", None) if folder_doc else None
+        # 🆕 Pending flag check karo — ho sakta hai kisi skip hui call
+        # ka isLastBatch=True yahin store hua ho (lock busy hone ki wajah se)
+        folder_doc_check = Folder.objects(id=folderId).first()
+        pending_flag = getattr(folder_doc_check, "pendingLastBatch", False) if folder_doc_check else False
 
-        if event_id and str(event_id).strip():
+        if pending_flag:
+            print(f"📌 Pending isLastBatch flag mila — naye images ke liye FRESH re-run trigger karenge")
+            Folder.objects(id=folderId).update_one(
+                set__pendingLastBatch=False,
+                set__clusteringStatus="DONE"
+            )
+
+            # Purane image_keys mein naye images nahi honge (wo tab fetch
+            # hue the jab ye run start hua tha). Isliye S3 se fresh poori
+            # list dobara nikaal kar isi function ko dobara call karo —
+            # ye naya run hi clustering + banner dono handle karega.
+            fresh_image_keys = list_s3_images(folder_name)
+            print(f"🔁 Fresh re-run: {len(fresh_image_keys)} images found in S3")
+
+            process_face_clustering_in_background(
+                fresh_image_keys, folderId, userId, folder_name, isLastBatch=True
+            )
+            return   # is (purane) run ka kaam yahin khatam — naya run banner bhi banayega
+
+        if isLastBatch:
+            print("🎨 Last batch received, generating banner...")
+
+            raw_order_id = getattr(folder_doc, 'orderId', None) if folder_doc else 'N/A'
+            display_order_id = int(raw_order_id) + 10800 if str(raw_order_id).isdigit() else raw_order_id
+            event_id = getattr(folder_doc, "eventId", None) if folder_doc else None
+
+            Folder.objects(id=folderId).update_one(
+                set__clusteringStatus="DONE"
+            )
+
             print(f"🎨 Generating Best Banner Image for Folder (Order ID: {display_order_id})...")
+
             banner_result = generate_and_save_folder_banner(folderId=folderId)
 
-        # 🟢 STEP 2: EVERYTHING COMPLETED SUCCESSFULLY -> MARK AS 'DONE'
-        Folder.objects(id=folderId).update_one(
-            set__clusteringStatus="DONE"
-        )
+            if banner_result.get("success"):
+                    banner_url = banner_result.get("bannerUrl")
+                    print(f"🎉 Banner automatically assigned: {banner_url}")
 
-        print(f"🎨 Generating Best Banner Image for Folder (Order ID: {display_order_id})...")
+                    NODE_API_URL = "https://horaservices.com/api/internal/generate-banner"
 
-        # Call Banner Generator Function
-        banner_result = generate_and_save_folder_banner(folderId=folderId)
+                    try:
+                        img_response = requests.get(banner_url, timeout=10)
+                        img_response.raise_for_status()
 
-        if banner_result.get("success"):
-            banner_url = banner_result.get("bannerUrl")
-            print(f"🎉 Banner automatically assigned: {banner_url}")
+                        image_bytes = io.BytesIO(img_response.content)
 
-            folder_doc = Folder.objects(id=folderId).first()
- 
-            # 2. NodeJS API Endpoint
-            NODE_API_URL = "https://horaservices.com/api/internal/generate-banner"
+                        payload = {
+                            "folderId": str(folderId),
+                        }
 
-            try:
-                img_response = requests.get(banner_url, timeout=10)
-                img_response.raise_for_status()
- 
-                image_bytes = io.BytesIO(img_response.content)
- 
-                payload = {
-                    "folderId": str(folderId),
-                }
- 
-                files = {
-                    "leftImage": ("left_image.jpg", image_bytes, "image/jpeg")
-                }
- 
-                response = requests.post(NODE_API_URL, data=payload, files=files, timeout=30)
-                res_data = response.json()
- 
-                if response.status_code == 200 and res_data.get("success"):
-                    print(f"✅ Node.js Canvas Banner Generated & Saved: {res_data.get('bannerUrl')}")
-                else:
-                    print(f"❌ Node.js API Error: {res_data.get('error') or res_data.get('message')}")
- 
-                image_bytes.close()
- 
-            except Exception as req_err:
-                print(f"❌ Error while calling Node.js Banner API: {str(req_err)}")
- 
+                        files = {
+                            "leftImage": ("left_image.jpg", image_bytes, "image/jpeg")
+                        }
+
+                        response = requests.post(
+                            NODE_API_URL,
+                            data=payload,
+                            files=files,
+                            timeout=30
+                        )
+
+                        res_data = response.json()
+
+                        if response.status_code == 200 and res_data.get("success"):
+                            print(
+                                f"✅ Node.js Canvas Banner Generated & Saved: "
+                                f"{res_data.get('bannerUrl')}"
+                            )
+                        else:
+                            print(
+                                f"❌ Node.js API Error: "
+                                f"{res_data.get('error') or res_data.get('message')}"
+                            )
+
+                        image_bytes.close()
+
+                    except Exception as req_err:
+                        print(
+                            f"❌ Error while calling Node.js Banner API: "
+                            f"{str(req_err)}"
+                        )
+
+            else:
+                    print("⚠️ Banner generation failed")
+
+
         else:
-            print(f"⚠️ eventId is missing or null for Folder ID {folderId}. Skipping banner generation.")
- 
+            Folder.objects(id=folderId).update_one(
+                set__clusteringStatus="DONE"
+            )
+            print("⏩ Not last batch, banner generation skipped")
+
     except Exception as e:
         print(f"❌ Error in background face recognition: {str(e)}")
         Folder.objects(id=folderId).update_one(
             set__clusteringStatus="FAILED"
         )
- 
+
+
  
 @app.post("/count-unique-persons")
 async def count_unique_persons(
     background_tasks: BackgroundTasks,
     folder_name: str = Form(...),
     folderId: str = Form(...),
-    userId: str = Form(...)  # ✅ Changed from userId to customerId
+    userId: str = Form(...),
+    isLastBatch: bool = Form(False),
 ):
     try:
         image_keys = list_s3_images(folder_name)
@@ -1166,14 +1423,18 @@ async def count_unique_persons(
         print(f"📦 Order ID    : {orderId}")  # ✅ Using orderId key
         print(f"👤 Customer ID : {userId}")  # ✅ Using customerId
         print(f"🖼️ S3 Images   : {len(image_keys)} files found")
+        print(f"isLast Batch.    : {isLastBatch}")
         print("📥" * 30 + "\n")
- 
+
+
+        print(f"=======================.   :{isLastBatch} =================")
         background_tasks.add_task(
             process_face_clustering_in_background,
             image_keys,
             folderId,
             userId,  # ✅ Passing customerId as userId parameter
-            folder_name
+            folder_name,
+            isLastBatch,
         )
  
         return {
