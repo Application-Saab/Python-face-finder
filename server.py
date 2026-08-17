@@ -633,7 +633,11 @@ def generate_and_save_folder_banner(folderId: str) -> dict:
         print(f"❌ Error in generate_and_save_folder_banner: {str(e)}")
         return {"success": False, "error": str(e)}
 
-    
+
+
+
+
+
 EPS = 0.6
 MIN_SAMPLES = 2
 MERGE_THRESHOLD = 0.50  
@@ -726,6 +730,31 @@ def is_real_human_face_batch(face_crops, threshold=REAL_FACE_THRESHOLD, batch_si
             results[i] = (False, 0.0)
  
     return results
+
+
+# =====================================================================
+# 🆕 FIX 3 (NAYI FUNCTION): Blurry / out-of-focus face reject karne ke liye.
+# Background me khada dhundhla dikhne wala person is check se hi filter
+# ho jayega — usko folder tak pahunchne ka mauka hi nahi milega.
+# =====================================================================
+def is_blurry_face(face_crop, threshold=60.0):
+    """
+    Laplacian variance nikaal ke batata hai face sharp hai ya blurry.
+    Kam variance = kam edges/detail = blurry image.
+    threshold apne actual data (kuch sharp vs blurry crops) pe test
+    karke tune karna — generally 40-80 ke beech acha kaam karta hai.
+    Zyada rakhoge to sharp faces bhi reject ho sakte hain, kam rakhoge
+    to blurry faces pass ho jayenge.
+    """
+    try:
+        if face_crop is None or face_crop.size == 0:
+            return True
+        gray = cv2.cvtColor(face_crop, cv2.COLOR_RGB2GRAY)
+        lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+        return lap_var < threshold
+    except Exception as e:
+        print(f"⚠️ is_blurry_face check failed: {e}")
+        return False
  
  
 def upload_face_crop(face_crop, folder_id, person_id):
@@ -799,7 +828,6 @@ def find_matching_person(new_embedding, existing_people):
 
     new_vec = new_embedding / (np.linalg.norm(new_embedding) + 1e-8)
 
-    # 🆕 DEBUG: har existing person ke against distance collect karo
     all_distances = []
 
     for person in existing_people:
@@ -815,7 +843,6 @@ def find_matching_person(new_embedding, existing_people):
             best_dist = cosine_dist
             best_sub_id = person["sub_id"]
 
-    # 🆕 DEBUG: saare distances ek line me print karo (readable format)
     if all_distances:
         print(f"📏 DISTANCES this cluster vs existing people -> {all_distances}")
 
@@ -823,9 +850,6 @@ def find_matching_person(new_embedding, existing_people):
         print(f"🔗 MATCH FOUND -> sub_id={best_sub_id} (distance={round(best_dist, 4)}, threshold={MERGE_THRESHOLD})")
         return best_sub_id
 
-    # 🆕 DEBUG LOG: match fail hua toh bhi best distance print karo.
-    # Isse pata chalega ki threshold kitna badhana chahiye — bina isse
-    # hum blindly guess kar rahe the.
     if best_sub_id is not None:
         print(f"❌ NO MATCH (closest was sub_id={best_sub_id}, "
               f"distance={round(best_dist, 4)}, threshold={MERGE_THRESHOLD}) "
@@ -889,9 +913,6 @@ def try_acquire_clustering_lock(folderId, isLastBatch=False):
     if result:
         return True
 
-    # Lock nahi mila -> agar ye call isLastBatch=True thi, toh uska
-    # flag folder doc pe save kar do taaki jo run currently chal raha
-    # hai, wo baad me isko dekh kar banner generate kar sake.
     if isLastBatch:
         Folder.objects(id=folderId).update_one(
             set__pendingLastBatch=True
@@ -934,23 +955,19 @@ def cleanup_small_side_face_folders(folderId):
  
             sub_id = str(subfolder._id)
  
-            # ✅ Live/real-time tagged count — WebLinks DB se (source of truth)
             actual_tagged_count = WebLinks.objects(folderIds=sub_id).count()
  
             is_side = getattr(subfolder, "isSideFace", None)
             should_delete = False
  
-            # 🎯 Core Requirement: isSideFace == True AND tagged count <= 2
             if is_side is True and actual_tagged_count <= 2:
                 should_delete = True
                 print(f"🔍 SIDE-FACE (Count={actual_tagged_count}): Deleting subfolder {sub_id}")
  
-            # Final Action Block
             if should_delete:
                 removed_count += 1
                 s3_key = getattr(subfolder.folderDp, "s3Key", None) if subfolder.folderDp else None
  
-                # 1. Delete S3 Crop Image
                 if s3_key:
                     try:
                         s3.delete_object(Bucket=S3_BUCKET, Key=s3_key)
@@ -958,7 +975,6 @@ def cleanup_small_side_face_folders(folderId):
                     except Exception as s3_err:
                         print(f"⚠️ S3 delete failed for {sub_id}: {s3_err}")
  
-                # 2. Untag WebLinks DB
                 try:
                     WebLinks.objects(folderIds=sub_id).update(pull__folderIds=sub_id)
                 except Exception as tag_err:
@@ -966,11 +982,9 @@ def cleanup_small_side_face_folders(folderId):
  
                 print(f"🗑️ SUCCESSFULLY REMOVED Side-Face Folder (ID: {sub_id}, Tagged Count: {actual_tagged_count})")
             else:
-                # Keep folder and sync real count
                 subfolder.personCount = actual_tagged_count
                 subfolders_to_keep.append(subfolder)
  
-        # Database update if any folder removed
         if removed_count > 0:
             folder_doc.subFolders = subfolders_to_keep
             folder_doc.totalPersonCount = max(0, (folder_doc.totalPersonCount or 0) - removed_count)
@@ -981,8 +995,39 @@ def cleanup_small_side_face_folders(folderId):
  
     except Exception as e:
         print(f"❌ Error in cleanup_small_side_face_folders: {str(e)}")
- 
- 
+
+
+
+
+def calculate_dp_quality_score(face_obj, face_crop):
+    """
+    DP ke liye best image select karne ka scoring system.
+    Smile / Frontal / Sharpness sab check karega.
+    """
+    score = 0.0
+
+    # 1️⃣ Detection score
+    det_score = getattr(face_obj, 'det_score', 0.5)
+    score += det_score * 20.0  # Max ~20 pts
+
+    # 2️⃣ Frontal vs Side
+    side_flag = is_side_face(face_obj)
+    if not side_flag:
+        score += 50.0  # Front face ko heavy priority
+
+    # 3️⃣ Blur Check (Laplacian Variance as Sharpness Score)
+    try:
+        gray = cv2.cvtColor(face_crop, cv2.COLOR_RGB2GRAY)
+        lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+        if lap_var >= 60.0:
+            score += min(30.0, lap_var / 5.0)  # Sharpness bonus up to 30 pts
+    except Exception:
+        pass
+
+    return score, side_flag
+
+
+
 def process_face_clustering_in_background(image_keys, folderId, userId, folder_name, isLastBatch=False):
     if not try_acquire_clustering_lock(folderId, isLastBatch):
         print(f"⏩ Background task SKIPPED for folder {folderId} — already in progress")
@@ -1001,8 +1046,6 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
         # =========================================================
         for keys in batches:
             imgs = [read_s3_image(k) for k in keys]
-            # NAYA ADDITION #3: is image-batch ke saare candidate faces
-            # pehle yaha collect honge, embeddings mein turant nahi jayenge
             batch_candidates = []
             for img, key in zip(imgs, keys):
                 if img is None:
@@ -1028,31 +1071,26 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                     if face_crop.size == 0:
                         face_crop = img[y1:y2, x1:x2]
 
-                    # Side-face decision on original face object
-                    side_flag = is_side_face(face)
 
-                    # PEHLE: yaha direct all_embeddings.append() ho raha tha.
-                    # AB: pehle candidates list mein daalte hain, taaki CLIP
-                    # filter run hone ke baad hi final embeddings mein jaaye
+                    # Blurry face check
+                    if is_blurry_face(face_crop):
+                        print(f"🚫 Blurry face rejected: {key}")
+                        continue
+
+                    # Side-face decision & Quality score calculation
+                    dp_quality_score, side_flag = calculate_dp_quality_score(face, face_crop)
+
                     batch_candidates.append({
-                        "key": key,
-                        "face_crop": face_crop.copy(),
-                        "det_score": det_score,
-                        "embedding": face.embedding,
-                        "is_side": side_flag,
-                        "embedding": face.embedding,
+                    "key": key,
+                    "face_crop": face_crop.copy(),
+                    "det_score": det_score,
+                    "embedding": face.embedding,
+                    "is_side": side_flag,
+                    "dp_quality_score": dp_quality_score,
                     })
-                # ^ "for face in faces:" loop yaha khatam
-            # ^ "for img, key in zip(imgs, keys):" loop bhi yaha khatam
-            # (CLIP filter block jaan-boojh kar is loop ke BAHAR rakha hai,
-            #  taaki ye sirf EK BAAR poore batch ke liye chale, har image
-            #  ke baad baar-baar nahi)
+                    
             if not batch_candidates:
                 continue
-            # =====================================================
-            # NAYA ADDITION #4: yaha CLIP filter chalta hai — is
-            # image-batch ke saare faces ek saath check hote hain
-            # =====================================================
             crops = [c["face_crop"] for c in batch_candidates]
             human_results = is_real_human_face_batch(crops)
 
@@ -1061,7 +1099,6 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                     print(f"🚫 Non-human face rejected (score={score:.2f}): {candidate['key']}")
                     continue
 
-                # Sirf REAL human faces hi embeddings/metadata mein jaate hain
                 all_embeddings.append(candidate["embedding"])
                 face_metadata.append({
                     "key": candidate["key"],
@@ -1069,6 +1106,7 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                     "det_score": candidate["det_score"],
                     "is_side": candidate["is_side"],
                     "embedding": candidate["embedding"],
+                    "dp_quality_score": candidate["dp_quality_score"],
                 })
         if not all_embeddings:
             print("⚠️ No faces detected in the given images.")
@@ -1093,15 +1131,16 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
             if current_group_id not in cluster_groups:
                 emb = metadata["embedding"]
 
+                # Unused key "max_score": metadata["det_score"] ko remove kar dein
                 cluster_groups[current_group_id] = {
-                    "images": [],
-                    "best_crop": metadata["face_crop"],
-                    "max_score": metadata["det_score"],
-                    "best_is_side": metadata["is_side"],
-                    "best_embedding": emb,
-                    "all_frontal_embeddings": [] if metadata["is_side"] else [metadata["embedding"]],
+                "images": [],
+                "best_crop": metadata["face_crop"],
+                "max_dp_score": metadata["dp_quality_score"], # 👈 Only use this
+                "best_is_side": metadata["is_side"],
+                "best_embedding": emb,
+                "all_frontal_embeddings": [] if metadata["is_side"] else [metadata["embedding"]],
                 }
-
+                
             else:
                 if not metadata["is_side"]:
                     cluster_groups[current_group_id]["all_frontal_embeddings"].append(metadata["embedding"])
@@ -1109,10 +1148,26 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
             if metadata["key"] not in cluster_groups[current_group_id]["images"]:
                 cluster_groups[current_group_id]["images"].append(metadata["key"])
 
-            if metadata["det_score"] > cluster_groups[current_group_id]["max_score"]:
+            # =========================================================
+            # 🆕 FIX 1: "best_is_side" ab yaha se REMOVE kar diya hai.
+            # Pehle ye det_score ke saath update hota tha, jiski wajah se
+            # side/frontal flag "kaunsa face highest score wala tha" pe
+            # depend karta tha — galat aur inconsistent. Ab niche alag
+            # se, cluster ke frontal-embeddings count se decide hoga.
+            # =========================================================
+            if metadata["dp_quality_score"] > cluster_groups[current_group_id]["max_dp_score"]:
                 cluster_groups[current_group_id]["best_crop"] = metadata["face_crop"]
-                cluster_groups[current_group_id]["max_score"] = metadata["det_score"]
-                cluster_groups[current_group_id]["best_is_side"] = metadata["is_side"]
+                cluster_groups[current_group_id]["max_dp_score"] = metadata["dp_quality_score"]
+
+        # =========================================================
+        # 🆕 FIX 1 (continued): Har cluster ka final "is_side" status
+        # ab robust tareeke se decide ho raha hai — agar cluster me
+        # koi bhi FRONTAL face mila hi nahi, tabhi use side-face maano.
+        # Isse "kisi cluster me sahi store, kisi me galat" wali
+        # inconsistency khatam ho jaayegi.
+        # =========================================================
+        for gid, gdata in cluster_groups.items():
+            gdata["best_is_side"] = len(gdata["all_frontal_embeddings"]) == 0
 
         print(f"🧩 DBSCAN se {len(cluster_groups)} cluster(s) bane is run me (EPS={EPS})")
 
@@ -1125,7 +1180,6 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
         removed_side_count = 0
         merged_count = 0
 
-        # 🆕 Existing persons load karo (pehle se ban chuke subfolders ke embeddings)
         folder_doc_for_match = Folder.objects(id=folderId).first()
         existing_people = []
         if folder_doc_for_match:
@@ -1143,7 +1197,6 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
 
             representative_embedding = compute_cluster_embedding(group_data)
 
-            # 🆕 DEBUG: batao ye cluster kaunsi group_id hai aur kitni images hain
             print(f"\n--- Processing cluster group_id={group_id} | images_in_cluster={len(group_data['images'])} | is_side={group_data['best_is_side']} ---")
 
             matched_sub_id = find_matching_person(representative_embedding, existing_people)
@@ -1152,7 +1205,13 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
             group_filenames = [k.split("/")[-1] for k in group_keys if "/" in k]
 
             if matched_sub_id:
-                # ===================== MERGE PATH =====================
+                # =====================================================
+                # 🆕 FIX 2: MERGE PATH — pehle yaha side-face+low-count
+                # filter apply hi nahi hota tha, isliye side-face clusters
+                # jab kisi existing (side-face) person se merge hote the,
+                # filter se bilkul bach jaate the. Ab yaha bhi same check
+                # add kiya gaya hai.
+                # =====================================================
                 sub_id = matched_sub_id
                 try:
                     folder_filter = Q(mainFolderId=folderId)
@@ -1167,29 +1226,50 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                     print(f"❌ Failed Bulk Tagging (merge) for Subfolder {sub_id}: {str(e)}")
 
                 actual_tagged_count = WebLinks.objects(folderIds=sub_id).count()
-                merged_count += 1
-                print(f"🔁 MERGED into existing person {sub_id} — new tagged count: {actual_tagged_count}")
 
+                # 🆕 Existing subfolder object dhoondo, aur agar naya
+                # cluster frontal hai to existing person ka isSideFace
+                # flag bhi False kar do (future me improve ho jaaye)
+                existing_sf = None
                 if folder_doc_for_match:
                     for sf in folder_doc_for_match.subFolders:
                         if str(sf._id) == sub_id:
-                            old_person_count = sf.personCount or 1
-                            sf.personCount = actual_tagged_count
-
-                            old_emb = getattr(sf, "embedding", None)
-                            if old_emb is not None and len(old_emb) > 0:
-                                updated_emb = update_running_centroid(
-                                    old_emb,
-                                    old_person_count,
-                                    representative_embedding
-                                )
-                                sf.embedding = list(map(float, updated_emb))
-
-                                for p in existing_people:
-                                    if p["sub_id"] == sub_id:
-                                        p["embedding"] = updated_emb
-                                        break
+                            if not group_data["best_is_side"]:
+                                sf.isSideFace = False
+                            existing_sf = sf
                             break
+
+                merged_is_side = getattr(existing_sf, "isSideFace", False) if existing_sf else False
+
+                # 🆕 SIDE-FACE + LOW-COUNT FILTER — ab merge path pe bhi lagu
+                if merged_is_side is True and actual_tagged_count <= 2:
+                    print(f"🔍 SIDE-FACE FILTER (merge path, count={actual_tagged_count}) — untagging {sub_id}")
+                    try:
+                        WebLinks.objects(folderIds=sub_id).update(pull__folderIds=sub_id)
+                    except Exception as tag_err:
+                        print(f"⚠️ Untagging failed for {sub_id}: {tag_err}")
+                    continue
+
+                merged_count += 1
+                print(f"🔁 MERGED into existing person {sub_id} — new tagged count: {actual_tagged_count}")
+
+                if existing_sf:
+                    old_person_count = existing_sf.personCount or 1
+                    existing_sf.personCount = actual_tagged_count
+
+                    old_emb = getattr(existing_sf, "embedding", None)
+                    if old_emb is not None and len(old_emb) > 0:
+                        updated_emb = update_running_centroid(
+                            old_emb,
+                            old_person_count,
+                            representative_embedding
+                        )
+                        existing_sf.embedding = list(map(float, updated_emb))
+
+                        for p in existing_people:
+                            if p["sub_id"] == sub_id:
+                                p["embedding"] = updated_emb
+                                break
 
                 continue
 
@@ -1210,22 +1290,18 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
             except Exception as e:
                 print(f"❌ Failed Bulk Tagging for Subfolder {sub_id}: {str(e)}")
 
-            # 2. Check Tagged Count from DB
             actual_tagged_count = WebLinks.objects(folderIds=sub_id).count()
             print(f"📊 Subfolder {sub_id} tagged count: {actual_tagged_count}")
 
-            # 3. Filter Check: Side Face + Count <= 2
             if group_data["best_is_side"] is True and actual_tagged_count <= 2:
                 removed_side_count += 1
                 print(f"🔍 SIDE-FACE FILTER (Count={actual_tagged_count}): Deleting crop & untagging subfolder {sub_id}")
 
-                # Delete Crop from S3
                 try:
                     s3.delete_object(Bucket=S3_BUCKET, Key=crop_key)
                 except Exception as s3_err:
                     print(f"⚠️ S3 delete failed for {sub_id}: {s3_err}")
 
-                # Untag WebLinks
                 try:
                     WebLinks.objects(folderIds=sub_id).update(pull__folderIds=sub_id)
                 except Exception as tag_err:
@@ -1249,7 +1325,6 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                 )
                 valid_subfolders.append(subfolder)
 
-                # 🆕 isi run ke andar bhi aage ke clusters isse match kar sakein
                 existing_people.append({
                     "sub_id": sub_id,
                     "embedding": representative_embedding
@@ -1273,16 +1348,19 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
         folder_doc.totalPersonCount = current_ai_person_count + len(valid_subfolders)
         folder_doc.uniqueFaceCount = (folder_doc.uniqueFaceCount or 0) + len(valid_subfolders)
 
-        # 🆕 Existing (merged) subfolders ka personCount bhi persist karo
         if folder_doc_for_match:
             updated_counts = {str(sf._id): sf.personCount for sf in folder_doc_for_match.subFolders}
             updated_embeddings = {str(sf._id): getattr(sf, "embedding", None) for sf in folder_doc_for_match.subFolders}
+            # 🆕 FIX 2: isSideFace ko bhi persist karo (merge path me update hua tha)
+            updated_side_flags = {str(sf._id): getattr(sf, "isSideFace", None) for sf in folder_doc_for_match.subFolders}
             for sf in folder_doc.subFolders:
                 sid = str(sf._id)
                 if sid in updated_counts:
                     sf.personCount = updated_counts[sid]
                 if updated_embeddings.get(sid):
                     sf.embedding = updated_embeddings[sid]
+                if updated_side_flags.get(sid) is not None:
+                    sf.isSideFace = updated_side_flags[sid]
 
 
         folder_doc.save()
@@ -1291,8 +1369,6 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
         # =========================================================
         # STAGE 5: BANNER GENERATION
         # =========================================================
-        # 🆕 Pending flag check karo — ho sakta hai kisi skip hui call
-        # ka isLastBatch=True yahin store hua ho (lock busy hone ki wajah se)
         folder_doc_check = Folder.objects(id=folderId).first()
         pending_flag = getattr(folder_doc_check, "pendingLastBatch", False) if folder_doc_check else False
 
@@ -1303,17 +1379,13 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                 set__clusteringStatus="DONE"
             )
 
-            # Purane image_keys mein naye images nahi honge (wo tab fetch
-            # hue the jab ye run start hua tha). Isliye S3 se fresh poori
-            # list dobara nikaal kar isi function ko dobara call karo —
-            # ye naya run hi clustering + banner dono handle karega.
             fresh_image_keys = list_s3_images(folder_name)
             print(f"🔁 Fresh re-run: {len(fresh_image_keys)} images found in S3")
 
             process_face_clustering_in_background(
                 fresh_image_keys, folderId, userId, folder_name, isLastBatch=True
             )
-            return   # is (purane) run ka kaam yahin khatam — naya run banner bhi banayega
+            return
 
         if isLastBatch:
             print("🎨 Last batch received, generating banner...")
@@ -1411,7 +1483,6 @@ async def count_unique_persons(
             print(f"⚠️ [API] No images found in S3 bucket for folder: {folder_name} (ID: {folderId})")
             return {"success": False, "message": "No images found in S3 bucket"}
  
-        # Folder doc se orderId aur folderName fetch kar rahe hain for logging
         folder_doc = Folder.objects(id=folderId).first()
         orderId = getattr(folder_doc, "orderId", "N/A") if folder_doc else "N/A"
         display_name = getattr(folder_doc, "folderName", folder_name) if folder_doc else folder_name
@@ -1420,8 +1491,8 @@ async def count_unique_persons(
         print(f"📌 [API RECEIVED] Count Unique Persons Triggered")
         print(f"📁 Folder Name : {display_name}")
         print(f"🆔 Folder ID   : {folderId}")
-        print(f"📦 Order ID    : {orderId}")  # ✅ Using orderId key
-        print(f"👤 Customer ID : {userId}")  # ✅ Using customerId
+        print(f"📦 Order ID    : {orderId}")
+        print(f"👤 Customer ID : {userId}")
         print(f"🖼️ S3 Images   : {len(image_keys)} files found")
         print(f"isLast Batch.    : {isLastBatch}")
         print("📥" * 30 + "\n")
@@ -1432,7 +1503,7 @@ async def count_unique_persons(
             process_face_clustering_in_background,
             image_keys,
             folderId,
-            userId,  # ✅ Passing customerId as userId parameter
+            userId,
             folder_name,
             isLastBatch,
         )
@@ -1446,7 +1517,10 @@ async def count_unique_persons(
     except Exception as e:
         print(f"❌ [API ERROR] Failed to initialize face count: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-    
+
+
+
+
 @app.post("/api/test/generate-banner/{folder_id}")
 async def test_generate_banner_endpoint(folder_id: str):
     """Directly triggers banner scoring logic & Node.js API call only if eventId exists in the folder."""
