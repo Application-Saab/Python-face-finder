@@ -55,6 +55,8 @@ class SubFolder(EmbeddedDocument):
         choices=["my_photos", "others"]
     )
 
+    embedding = ListField(FloatField())
+
     userId = StringField(
         required=True
     )
@@ -120,6 +122,9 @@ class Folder(Document):
         required=True
     )
 
+    uniqueFaceCount = IntField(default=0)  
+
+
     viewedBy = DynamicField()
 
     clickCount = IntField(
@@ -157,6 +162,7 @@ class Folder(Document):
         default="IN_PROGRESS",
         choices=["IN_PROGRESS", "DONE", "FAILED"]
     )
+    pendingLastBatch = BooleanField(default=False)
 
     createdAt = DateTimeField(
         default=datetime.utcnow
