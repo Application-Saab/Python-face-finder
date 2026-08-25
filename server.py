@@ -638,6 +638,7 @@ EPS = 0.6
 MIN_SAMPLES = 2
 MERGE_THRESHOLD = 0.50  
 STALE_LOCK_MINUTES = 15
+BLUR_THRESHOLD = 300.0
  
  
 # =====================================================================
@@ -781,6 +782,17 @@ def is_side_face(face_obj):
  
     except Exception as e:
         print(f"⚠️ is_side_face check failed: {e}")
+        return False
+
+
+def is_blurry_face(face_crop, threshold=BLUR_THRESHOLD):
+    try:
+        gray = cv2.cvtColor(face_crop, cv2.COLOR_RGB2GRAY)
+        lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+        print(f"🔬 BLUR VARIANCE = {lap_var:.2f} (threshold={threshold})")
+        return lap_var < threshold
+    except Exception as e:
+        print(f"⚠️ is_blurry_face check failed: {e}")
         return False
 
 
@@ -1028,6 +1040,10 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                     if face_crop.size == 0:
                         face_crop = img[y1:y2, x1:x2]
 
+                    if is_blurry_face(face_crop):
+                        print(f"🚫 Blurry face rejected: {key}")
+                        continue
+
                     # Side-face decision on original face object
                     side_flag = is_side_face(face)
 
@@ -1194,6 +1210,14 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                 continue
 
             # ===================== CREATE PATH (naya person) =====================
+
+            try:
+                _gray_check = cv2.cvtColor(group_data["best_crop"], cv2.COLOR_RGB2GRAY)
+                _final_variance = cv2.Laplacian(_gray_check, cv2.CV_64F).var()
+                print(f"🖼️ FOLDER CROP VARIANCE = {_final_variance:.2f} (group_id={group_id})")
+            except Exception as _e:
+                print(f"⚠️ Folder crop variance check failed: {_e}")
+            
             person_id = str(uuid.uuid4())
             crop_key, crop_url = upload_face_crop(group_data["best_crop"], folderId, person_id)
             sub_id = str(bson.ObjectId())
