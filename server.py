@@ -638,7 +638,7 @@ EPS = 0.6
 MIN_SAMPLES = 2
 MERGE_THRESHOLD = 0.50  
 STALE_LOCK_MINUTES = 15
-BLUR_THRESHOLD = 250.0
+BLUR_THRESHOLD = 300.0
  
  
 # =====================================================================
