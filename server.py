@@ -782,6 +782,11 @@ def score_orientation_angle(image, angle):
         "weighted_total": weighted_total
     }
 
+# Zero-bias ke liye ab weighted_total compare hoga, raw average score nahi —
+# kyunki weighted_total detection-confidence ko bhi account karta hai, jo
+# single-face portrait-rotated shots ke liye zyada reliable signal hai.
+ORIENTATION_ZERO_BIAS_WEIGHTED_MARGIN = 0.10
+
 
 def detect_image_orientation(image, content_bytes=None):
     """
@@ -803,43 +808,41 @@ def detect_image_orientation(image, content_bytes=None):
         result = score_orientation_angle(image, angle)
         candidates.append(result)
 
-    # angle=0 ka result sort se pehle hi nikaal ke rakh lo,
-    # taaki baad me "already sahi hai" fallback ke liye use kar sakein
     zero_candidate = next(c for c in candidates if c["angle"] == 0)
 
-    # 🔧 CHANGED: ab weighted_total se sort ho raha hai, average score se nahi.
-    # Isse multi-face (group photo) candidates ko unka due weight milta hai —
-    # 5 corroborating faces, 1 marginal face se zyada trust deserve karte hain.
+    # weighted_total se sort — multi-face group photos ke liye
+    # ye already sahi kaam kar raha hai
     candidates.sort(key=lambda x: x["weighted_total"], reverse=True)
-
-    # -----------------------------------------
-    # 🔧 FACE-COUNT TIE-BREAK REMOVED
-    # Purana logic face-count se direct tie-break karta tha, jo
-    # false-positive-prone tha. Ab weighted_total sort hi is
-    # kaam ko sahi tareeke se, automatically kar deta hai.
-    # -----------------------------------------
 
     best = candidates[0]
     second = candidates[1] if len(candidates) > 1 else None
 
-    # NOTE: neeche wale confidence/ambiguous checks best["score"]
-    # (per-face average) use karte hain — weighted_total sirf
-    # RANKING ke liye tha, threshold checks ke liye nahi.
     best_score = best["score"]
     second_score = second["score"] if second else 0
     margin = best_score - second_score
 
     # -----------------------------------------
-    # 🔧 ZERO-BIAS SAFETY CHECK
-    # Agar winner 0° nahi hai, lekin 0° ka score winner ke bahut
-    # kareeb hai, to rotate mat karo. Isse already-sahi images
-    # accidentally flip hone se bach jaati hain.
+    # 🔧 ZERO-BIAS SAFETY CHECK — FIXED
+    # Purana version raw average `score` compare karta tha, jo
+    # single-face portrait-rotated shots (camera 90° ghuma ke
+    # khincha gaya) ke liye galat tha: wahan 0° pe bhi kabhi
+    # kabhi ek marginal/low-confidence face detect ho jaata hai
+    # jiska orientation-score fluke se close aa jaata hai — chahe
+    # actual rotation clearly kisi aur angle pe ho.
+    #
+    # Ab hum `weighted_total` (jo detection-confidence * orientation
+    # score hai) compare karte hain. Agar winning angle ka
+    # weighted_total already 0° se KAAFI zyada hai — matlab face
+    # detector us angle pe zyada confident tha — to override mat
+    # karo, winning angle pe hi bharosa karo.
     # -----------------------------------------
     if best["angle"] != 0 and zero_candidate["faces"] > 0:
-        if (best_score - zero_candidate["score"]) < ORIENTATION_ZERO_BIAS_MARGIN:
+        weighted_gap = best["weighted_total"] - zero_candidate["weighted_total"]
+
+        if weighted_gap < ORIENTATION_ZERO_BIAS_WEIGHTED_MARGIN:
             print(
-                f"⚠️ Best={best['angle']}° (score={best_score:.4f}) but "
-                f"0° is nearly as good (score={zero_candidate['score']:.4f}) "
+                f"⚠️ Best={best['angle']}° (weighted={best['weighted_total']:.4f}) "
+                f"but 0° weighted is close (weighted={zero_candidate['weighted_total']:.4f}) "
                 f"-> keeping 0°, not rotating"
             )
             best = zero_candidate
@@ -848,6 +851,11 @@ def detect_image_orientation(image, content_bytes=None):
             second = remaining[0] if remaining else None
             second_score = second["score"] if second else 0
             margin = best_score - second_score
+        else:
+            print(
+                f"✅ Best={best['angle']}° weighted_total ({best['weighted_total']:.4f}) "
+                f"clearly beats 0° ({zero_candidate['weighted_total']:.4f}) -> trusting {best['angle']}°"
+            )
 
     has_exif = False
     exif_rotation = 0
@@ -864,9 +872,6 @@ def detect_image_orientation(image, content_bytes=None):
     print("Margin:", round(margin, 4))
     print("Has EXIF tag:", has_exif, "| EXIF Rotation:", exif_rotation)
 
-    # -----------------------------------------
-    # No face -> sirf tabhi EXIF ka sahara (last resort)
-    # -----------------------------------------
     if best["faces"] == 0:
         if has_exif and exif_rotation != 0:
             print(f"📐 No face, EXIF says {exif_rotation}° -> using EXIF (last resort)")
@@ -889,15 +894,6 @@ def detect_image_orientation(image, content_bytes=None):
             "candidates": candidates
         }
 
-    # -----------------------------------------
-    # 🔧 EXIF-conflict-override HATA DIYA
-    # Face jab mil raha hai, tab EXIF ko ignore karo —
-    # DSLR EXIF unreliable hai is use-case ke liye.
-    # -----------------------------------------
-
-    # -----------------------------------------
-    # Very low confidence
-    # -----------------------------------------
     if best_score < ORIENTATION_MIN_CONFIDENCE:
         print("⚠️ Low confidence -> rotation 0")
         return {
@@ -909,9 +905,6 @@ def detect_image_orientation(image, content_bytes=None):
             "candidates": candidates
         }
 
-    # -----------------------------------------
-    # Ambiguous
-    # -----------------------------------------
     if margin < ORIENTATION_MIN_MARGIN:
         print("⚠️ Ambiguous orientation")
         print(f"⚠️ But using best candidate: {best['angle']}°")
@@ -924,9 +917,6 @@ def detect_image_orientation(image, content_bytes=None):
             "candidates": candidates
         }
 
-    # -----------------------------------------
-    # SUCCESS
-    # -----------------------------------------
     print(f"✅ Orientation detected: {best['angle']}°")
     return {
         "rotation": best["angle"],
@@ -936,6 +926,7 @@ def detect_image_orientation(image, content_bytes=None):
         "reason": "orientation_detected",
         "candidates": candidates
     }
+
 
 def get_exif_rotation(content_bytes):
     """
