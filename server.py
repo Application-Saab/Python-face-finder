@@ -63,8 +63,373 @@ EXECUTOR = ThreadPoolExecutor(max_workers=3)
 
 app = FastAPI(title="Face Recognition Server", version="1.0.0")
 
+ORIENTATION_ANGLES = [0, 90, 180, 270]
 
-# Add CORS middleware
+ORIENTATION_MIN_FACE_SCORE = 0.50
+ORIENTATION_MIN_CONFIDENCE = 0.65
+ORIENTATION_MIN_MARGIN = 0.08
+
+EXIF_ORIENTATION_TO_ROTATION = {
+    1: 0,
+    3: 180,
+    6: 90,
+    8: 270,
+}
+
+
+def resize_for_orientation_detection(image, max_size=1600):
+    """
+    AI ke liye image ko chhota karta hai.
+    Original image ko modify nahi karta.
+    """
+    height, width = image.shape[:2]
+    largest = max(width, height)
+
+    if largest <= max_size:
+        return image
+
+    scale = max_size / largest
+    new_width = int(width * scale)
+    new_height = int(height * scale)
+
+    return cv2.resize(
+        image,
+        (new_width, new_height),
+        interpolation=cv2.INTER_AREA
+    )
+
+
+def rotate_for_orientation(image, angle):
+    """
+    OpenCV rotation.
+    """
+    if angle == 0:
+        return image
+
+    if angle == 90:
+        return cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+
+    if angle == 180:
+        return cv2.rotate(image, cv2.ROTATE_180)
+
+    if angle == 270:
+        return cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+    return image
+
+ORIENTATION_ANGLES = [0, 90, 180, 270]
+
+ORIENTATION_MIN_FACE_SCORE = 0.50
+ORIENTATION_MIN_CONFIDENCE = 0.65
+ORIENTATION_MIN_MARGIN = 0.08
+ORIENTATION_ZERO_BIAS_MARGIN = 0.03
+
+
+def calculate_face_upright_score(face):
+    """
+    Face landmarks + bounding box dono use karta hai.
+    Bounding box se "sir vs daadi" (head-top vs chin) signal
+    milta hai jo landmark-noise se zyada robust hai —
+    khaaskar tilted/embrace poses ke liye.
+    """
+    try:
+        kps = getattr(face, "kps", None)
+        bbox = getattr(face, "bbox", None)
+
+        if kps is None or bbox is None:
+            return 0.0
+
+        kps = np.asarray(kps)
+        if kps.shape[0] < 5:
+            return 0.0
+
+        left_eye = kps[0]
+        right_eye = kps[1]
+        nose = kps[2]
+        left_mouth = kps[3]
+        right_mouth = kps[4]
+
+        eye_distance = np.linalg.norm(right_eye - left_eye)
+        if eye_distance < 1:
+            return 0.0
+
+        x1, y1, x2, y2 = bbox
+        box_height = y2 - y1
+        if box_height < 1:
+            return 0.0
+
+        eye_center_y = (left_eye[1] + right_eye[1]) / 2
+        eye_position_ratio = (eye_center_y - y1) / box_height
+
+        head_position_score = float(
+            np.clip(1.0 - (eye_position_ratio / 0.5), 0.0, 1.0)
+        )
+        eye_vertical_difference = abs(left_eye[1] - right_eye[1])
+        eye_alignment = 1.0 - min(eye_vertical_difference / eye_distance, 1.0)
+
+        mouth_center_y = (left_mouth[1] + right_mouth[1]) / 2
+
+        nose_offset_ratio = (nose[1] - eye_center_y) / eye_distance
+        nose_score = float(np.clip(nose_offset_ratio / 0.3, 0.0, 1.0))
+
+        mouth_offset_ratio = (mouth_center_y - nose[1]) / eye_distance
+        mouth_score = float(np.clip(mouth_offset_ratio / 0.3, 0.0, 1.0))
+
+        min_eye_x = min(left_eye[0], right_eye[0])
+        max_eye_x = max(left_eye[0], right_eye[0])
+        nose_center_score = 1.0 if min_eye_x <= nose[0] <= max_eye_x else 0.0
+        score = (
+            head_position_score * 0.15 +
+            nose_score * 0.30 +
+            mouth_score * 0.30 +
+            eye_alignment * 0.15 +
+            nose_center_score * 0.10
+        )
+
+        return float(score)
+
+    except Exception as e:
+        print(f"⚠️ Orientation face score error: {e}")
+        return 0.0
+
+
+def score_orientation_angle(image, angle):
+    """
+    Ek angle ko test karta hai.
+    """
+    rotated = rotate_for_orientation(image, angle)
+
+    faces = searcher.app.get(rotated)
+
+    valid_faces = []
+
+    for face in faces:
+        detection_score = float(getattr(face, "det_score", 0))
+
+        if detection_score < ORIENTATION_MIN_FACE_SCORE:
+            continue
+
+        orientation_score = calculate_face_upright_score(face)
+
+        valid_faces.append({
+            "detection": detection_score,
+            "orientation": orientation_score
+        })
+
+    if not valid_faces:
+        return {"angle": angle, "score": 0.0, "faces": 0, "weighted_total": 0.0}
+
+    scores = [item["orientation"] for item in valid_faces]
+    average_score = float(np.mean(scores))
+    weighted_total = float(sum(
+        item["detection"] * item["orientation"] for item in valid_faces
+    ))
+
+    return {
+        "angle": angle,
+        "score": average_score,
+        "faces": len(valid_faces),
+        "weighted_total": weighted_total
+    }
+
+ORIENTATION_ZERO_BIAS_WEIGHTED_MARGIN = 0.10
+
+
+def detect_image_orientation(image, content_bytes=None):
+    """
+    0 / 90 / 180 / 270 sab test karke
+    best upright orientation choose karta hai.
+
+    NOTE: DSLR cameras (jaise ye wedding shoot) mein zyadatar
+    gyroscope/orientation sensor nahi hota, isliye EXIF Orientation
+    tag hamesha ek fixed default value likhta hai — chahe photo
+    kisi bhi angle pe khinchi gayi ho. Isliye EXIF ko face-detection
+    ke against "conflict override" ke liye use NAHI karte.
+    EXIF sirf tab use hota hai jab face bilkul na mile (last resort).
+    """
+
+    image = resize_for_orientation_detection(image, max_size=1600)
+
+    candidates = []
+    for angle in ORIENTATION_ANGLES:
+        result = score_orientation_angle(image, angle)
+        candidates.append(result)
+
+    zero_candidate = next(c for c in candidates if c["angle"] == 0)
+
+    candidates.sort(key=lambda x: x["weighted_total"], reverse=True)
+
+    best = candidates[0]
+    second = candidates[1] if len(candidates) > 1 else None
+
+    best_score = best["score"]
+    second_score = second["score"] if second else 0
+    margin = best_score - second_score
+
+    if best["angle"] != 0 and zero_candidate["faces"] > 0:
+        weighted_gap = best["weighted_total"] - zero_candidate["weighted_total"]
+
+        if weighted_gap < ORIENTATION_ZERO_BIAS_WEIGHTED_MARGIN:
+            print(
+                f"⚠️ Best={best['angle']}° (weighted={best['weighted_total']:.4f}) "
+                f"but 0° weighted is close (weighted={zero_candidate['weighted_total']:.4f}) "
+                f"-> keeping 0°, not rotating"
+            )
+            best = zero_candidate
+            best_score = zero_candidate["score"]
+            remaining = [c for c in candidates if c["angle"] != 0]
+            second = remaining[0] if remaining else None
+            second_score = second["score"] if second else 0
+            margin = best_score - second_score
+        else:
+            print(
+                f"✅ Best={best['angle']}° weighted_total ({best['weighted_total']:.4f}) "
+                f"clearly beats 0° ({zero_candidate['weighted_total']:.4f}) -> trusting {best['angle']}°"
+            )
+
+    has_exif = False
+    exif_rotation = 0
+    if content_bytes is not None:
+        has_exif, exif_rotation = get_exif_rotation(content_bytes)
+
+    print("\n==============================")
+    print("ORIENTATION RESULT")
+    print("==============================")
+    print("Candidates:", candidates)
+    print("Best Angle (face-based):", best["angle"])
+    print("Best Score:", round(best_score, 4))
+    print("Second Score:", round(second_score, 4))
+    print("Margin:", round(margin, 4))
+    print("Has EXIF tag:", has_exif, "| EXIF Rotation:", exif_rotation)
+
+    if best["faces"] == 0:
+        if has_exif and exif_rotation != 0:
+            print(f"📐 No face, EXIF says {exif_rotation}° -> using EXIF (last resort)")
+            return {
+                "rotation": exif_rotation,
+                "confidence": 0,
+                "faces": 0,
+                "autoRotated": True,
+                "reason": "no_face_exif_fallback",
+                "candidates": candidates
+            }
+
+        print("⚠️ No face detected & no EXIF hint -> rotation 0")
+        return {
+            "rotation": 0,
+            "confidence": 0,
+            "faces": 0,
+            "autoRotated": False,
+            "reason": "no_face_detected",
+            "candidates": candidates
+        }
+
+    if best_score < ORIENTATION_MIN_CONFIDENCE:
+        print("⚠️ Low confidence -> rotation 0")
+        return {
+            "rotation": 0,
+            "confidence": round(best_score, 4),
+            "faces": best["faces"],
+            "autoRotated": False,
+            "reason": "low_confidence",
+            "candidates": candidates
+        }
+
+    if margin < ORIENTATION_MIN_MARGIN:
+        print("⚠️ Ambiguous orientation")
+        print(f"⚠️ But using best candidate: {best['angle']}°")
+        return {
+            "rotation": best["angle"],
+            "confidence": round(best_score, 4),
+            "faces": best["faces"],
+            "autoRotated": best["angle"] != 0,
+            "reason": "ambiguous_best_candidate_used",
+            "candidates": candidates
+        }
+
+    print(f"✅ Orientation detected: {best['angle']}°")
+    return {
+        "rotation": best["angle"],
+        "confidence": round(best_score, 4),
+        "faces": best["faces"],
+        "autoRotated": best["angle"] != 0,
+        "reason": "orientation_detected",
+        "candidates": candidates
+    }
+
+
+def get_exif_rotation(content_bytes):
+    """
+    Returns (has_tag: bool, rotation: int)
+    EXIF Orientation tag missing hone par has_tag=False —
+    taaki "tag missing" ko "genuine 0" na samjha jaye.
+    """
+    try:
+        img = Image.open(io.BytesIO(content_bytes))
+        exif = img.getexif()
+        orientation_tag = exif.get(274)  
+
+        if orientation_tag is None:
+            return False, 0
+
+        rotation = EXIF_ORIENTATION_TO_ROTATION.get(orientation_tag, 0)
+        return True, rotation
+
+    except Exception as e:
+        print(f"⚠️ EXIF read error: {e}")
+        return False, 0
+
+@app.post("/detect-orientation")
+async def detect_orientation_api(file: UploadFile = File(...)):
+    try:
+        print("\n===================================")
+        print("🤖 ORIENTATION API REQUEST")
+        print("Filename:", file.filename)
+        print("===================================")
+
+        content = await file.read()
+
+        array = np.frombuffer(content, dtype=np.uint8)
+        image = cv2.imdecode(
+            array,
+            cv2.IMREAD_IGNORE_ORIENTATION | cv2.IMREAD_COLOR
+        )
+
+        if image is None:
+            return {
+                "success": False,
+                "filename": file.filename,
+                "rotation": 0,
+                "confidence": 0,
+                "autoRotated": False,
+                "reason": "invalid_image"
+            }
+
+        print("Original image size:", image.shape[1], "x", image.shape[0])
+
+        result = detect_image_orientation(image, content_bytes=content)
+
+        return {
+            "success": True,
+            "filename": file.filename,
+            **result
+        }
+
+    except Exception as error:
+        print("❌ ORIENTATION API ERROR:", str(error))
+        return {
+            "success": False,
+            "filename": file.filename,
+            "rotation": 0,
+            "confidence": 0,
+            "faces": 0,
+            "autoRotated": False,
+            "reason": "python_error",
+            "error": str(error)
+        }
+
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
