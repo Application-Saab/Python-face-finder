@@ -728,16 +728,27 @@ def is_real_human_face_batch(face_crops, threshold=REAL_FACE_THRESHOLD, batch_si
  
     return results
  
- 
 def upload_face_crop(face_crop, folder_id, person_id):
+    h, w = face_crop.shape[:2]
+    MIN_DP_SIZE = 250
+    if max(h, w) < MIN_DP_SIZE:
+        scale = MIN_DP_SIZE / max(h, w)
+        new_w, new_h = int(w * scale), int(h * scale)
+        face_crop = cv2.resize(
+            face_crop, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4
+        )
+        if scale > 1.8:
+            face_crop = sharpen_crop(face_crop)
+
     buffer = io.BytesIO()
     Image.fromarray(face_crop).save(
         buffer,
         format="WEBP",
-        quality=90
+        quality=95,
+        method=6
     )
     buffer.seek(0)
- 
+
     crop_key = f"face-groups/{folder_id}/{person_id}.webp"
     s3.upload_fileobj(
         buffer,
@@ -745,11 +756,21 @@ def upload_face_crop(face_crop, folder_id, person_id):
         crop_key,
         ExtraArgs={"ContentType": "image/webp"}
     )
- 
+
     crop_url = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{crop_key}"
     return crop_key, crop_url
- 
- 
+
+def compute_sharpness(face_crop):
+    """
+    Sirf sharpness measure karta hai (Laplacian variance), koi side-effect nahi.
+    Isse best_crop selection me det_score ke saath-saath sharpness bhi factor banta hai.
+    """
+    try:
+        gray = cv2.cvtColor(face_crop, cv2.COLOR_RGB2GRAY)
+        return cv2.Laplacian(gray, cv2.CV_64F).var()
+    except Exception:
+        return 0.0
+
 def is_side_face(face_obj):
     try:
         # 1️⃣ Agar InsightFace ne direct Pose Angle (Yaw) detect kiya hai
@@ -785,6 +806,41 @@ def is_side_face(face_obj):
         return False
 
 
+_SMILE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_smile.xml")
+
+
+def is_smiling_face(face_crop):
+    """
+    face_crop: RGB numpy array (tight recognition crop)
+    Return: True agar smile detect hua, warna False
+    """
+    try:
+        gray = cv2.cvtColor(face_crop, cv2.COLOR_RGB2GRAY)
+        gray = cv2.equalizeHist(gray)  
+        smiles = _SMILE_CASCADE.detectMultiScale(
+            gray,
+            scaleFactor=1.7,
+            minNeighbors=22,
+            minSize=(int(gray.shape[1] * 0.3), int(gray.shape[0] * 0.15))
+        )
+        return len(smiles) > 0
+    except Exception as e:
+        print(f"⚠️ is_smiling_face check failed: {e}")
+        return False
+
+
+def sharpen_crop(img):
+    """
+    Heavy upscale ke baad blockiness kam dikhane ke liye halka unsharp-mask.
+    """
+    try:
+        blurred = cv2.GaussianBlur(img, (0, 0), sigmaX=2)
+        sharpened = cv2.addWeighted(img, 1.4, blurred, -0.4, 0)
+        return sharpened
+    except Exception:
+        return img
+
+    
 def is_blurry_face(face_crop, threshold=BLUR_THRESHOLD):
     try:
         gray = cv2.cvtColor(face_crop, cv2.COLOR_RGB2GRAY)
@@ -1011,10 +1067,10 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
         # =========================================================
         # STAGE 1: EXTRACT EMBEDDINGS FROM ALL IMAGES
         # =========================================================
+        DISPLAY_PAD_RATIO = 0.60
+
         for keys in batches:
             imgs = [read_s3_image(k) for k in keys]
-            # NAYA ADDITION #3: is image-batch ke saare candidate faces
-            # pehle yaha collect honge, embeddings mein turant nahi jayenge
             batch_candidates = []
             for img, key in zip(imgs, keys):
                 if img is None:
@@ -1030,6 +1086,7 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                     face_w, face_h = x2 - x1, y2 - y1
                     if face_w < 35 or face_h < 35:
                         continue
+
                     pad_x, pad_y = int(face_w * 0.20), int(face_h * 0.20)
                     h, w = img.shape[:2]
                     crop_x1 = max(0, x1 - pad_x)
@@ -1040,34 +1097,40 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                     if face_crop.size == 0:
                         face_crop = img[y1:y2, x1:x2]
 
+                    disp_pad_x = int(face_w * DISPLAY_PAD_RATIO)
+                    disp_pad_y = int(face_h * DISPLAY_PAD_RATIO)
+                    disp_x1 = max(0, x1 - disp_pad_x)
+                    disp_y1 = max(0, y1 - disp_pad_y)
+                    disp_x2 = min(w, x2 + disp_pad_x)
+                    disp_y2 = min(h, y2 + disp_pad_y)
+                    display_crop = img[disp_y1:disp_y2, disp_x1:disp_x2]
+                    if display_crop.size == 0:
+                        display_crop = face_crop
+
                     if is_blurry_face(face_crop):
                         print(f"🚫 Blurry face rejected: {key}")
                         continue
 
-                    # Side-face decision on original face object
                     side_flag = is_side_face(face)
+                    smile_flag = is_smiling_face(face_crop)
 
-                    # PEHLE: yaha direct all_embeddings.append() ho raha tha.
-                    # AB: pehle candidates list mein daalte hain, taaki CLIP
-                    # filter run hone ke baad hi final embeddings mein jaaye
                     batch_candidates.append({
                         "key": key,
                         "face_crop": face_crop.copy(),
+                        "display_crop": display_crop.copy(),
                         "det_score": det_score,
                         "embedding": face.embedding,
                         "is_side": side_flag,
-                        "embedding": face.embedding,
+                        "is_smile": smile_flag,
+                        "face_w": face_w,
+                        "face_h": face_h,
                     })
                 # ^ "for face in faces:" loop yaha khatam
             # ^ "for img, key in zip(imgs, keys):" loop bhi yaha khatam
-            # (CLIP filter block jaan-boojh kar is loop ke BAHAR rakha hai,
-            #  taaki ye sirf EK BAAR poore batch ke liye chale, har image
-            #  ke baad baar-baar nahi)
             if not batch_candidates:
                 continue
             # =====================================================
-            # NAYA ADDITION #4: yaha CLIP filter chalta hai — is
-            # image-batch ke saare faces ek saath check hote hain
+            # CLIP filter
             # =====================================================
             crops = [c["face_crop"] for c in batch_candidates]
             human_results = is_real_human_face_batch(crops)
@@ -1077,13 +1140,16 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                     print(f"🚫 Non-human face rejected (score={score:.2f}): {candidate['key']}")
                     continue
 
-                # Sirf REAL human faces hi embeddings/metadata mein jaate hain
                 all_embeddings.append(candidate["embedding"])
                 face_metadata.append({
                     "key": candidate["key"],
                     "face_crop": candidate["face_crop"],
+                    "display_crop": candidate["display_crop"],
                     "det_score": candidate["det_score"],
                     "is_side": candidate["is_side"],
+                    "is_smile": candidate["is_smile"],
+                    "face_w": candidate["face_w"],
+                    "face_h": candidate["face_h"],
                     "embedding": candidate["embedding"],
                 })
         if not all_embeddings:
@@ -1100,20 +1166,31 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
         labels = clustering.fit_predict(np_embeddings)
         cluster_groups = {}
         noise_id_counter = -2
+
+        MIN_GOOD_FACE_SIZE = 90  
+
         for label, metadata in zip(labels, face_metadata):
             if label == -1:
                 current_group_id = noise_id_counter
                 noise_id_counter -= 1
             else:
                 current_group_id = label
+
+            crop_sharpness = compute_sharpness(metadata["face_crop"])
+            face_size = min(metadata["face_w"], metadata["face_h"])
+
             if current_group_id not in cluster_groups:
                 emb = metadata["embedding"]
 
                 cluster_groups[current_group_id] = {
                     "images": [],
                     "best_crop": metadata["face_crop"],
+                    "best_display_crop": metadata["display_crop"],
                     "max_score": metadata["det_score"],
+                    "best_sharpness": crop_sharpness,
                     "best_is_side": metadata["is_side"],
+                    "best_is_smile": metadata["is_smile"],
+                    "best_face_size": face_size,
                     "best_embedding": emb,
                     "all_frontal_embeddings": [] if metadata["is_side"] else [metadata["embedding"]],
                 }
@@ -1125,10 +1202,48 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
             if metadata["key"] not in cluster_groups[current_group_id]["images"]:
                 cluster_groups[current_group_id]["images"].append(metadata["key"])
 
-            if metadata["det_score"] > cluster_groups[current_group_id]["max_score"]:
-                cluster_groups[current_group_id]["best_crop"] = metadata["face_crop"]
-                cluster_groups[current_group_id]["max_score"] = metadata["det_score"]
-                cluster_groups[current_group_id]["best_is_side"] = metadata["is_side"]
+            group = cluster_groups[current_group_id]
+
+            new_good_size = 1 if face_size >= MIN_GOOD_FACE_SIZE else 0
+            old_good_size = 1 if group["best_face_size"] >= MIN_GOOD_FACE_SIZE else 0
+
+            new_priority = (new_good_size, 0 if metadata["is_side"] else 1, 1 if metadata["is_smile"] else 0)
+            old_priority = (old_good_size, 0 if group["best_is_side"] else 1, 1 if group["best_is_smile"] else 0)
+
+            if new_priority > old_priority:
+                group["best_crop"] = metadata["face_crop"]
+                group["best_display_crop"] = metadata["display_crop"]
+                group["max_score"] = metadata["det_score"]
+                group["best_sharpness"] = crop_sharpness
+                group["best_is_side"] = metadata["is_side"]
+                group["best_is_smile"] = metadata["is_smile"]
+                group["best_face_size"] = face_size
+
+            elif new_priority == old_priority:
+                current_best_det = group["max_score"]
+                current_best_sharp = group["best_sharpness"]
+
+                det_close_enough = metadata["det_score"] >= (current_best_det - 0.05)
+                is_sharper = crop_sharpness > current_best_sharp
+
+                if is_sharper and det_close_enough:
+                    group["best_crop"] = metadata["face_crop"]
+                    group["best_display_crop"] = metadata["display_crop"]
+                    group["best_sharpness"] = crop_sharpness
+                    group["best_is_side"] = metadata["is_side"]
+                    group["best_is_smile"] = metadata["is_smile"]
+                    group["best_face_size"] = face_size
+                    if metadata["det_score"] > current_best_det:
+                        group["max_score"] = metadata["det_score"]
+                elif metadata["det_score"] > current_best_det + 0.05:
+                    group["best_crop"] = metadata["face_crop"]
+                    group["best_display_crop"] = metadata["display_crop"]
+                    group["max_score"] = metadata["det_score"]
+                    group["best_sharpness"] = crop_sharpness
+                    group["best_is_side"] = metadata["is_side"]
+                    group["best_is_smile"] = metadata["is_smile"]
+                    group["best_face_size"] = face_size
+            # else: purana wala hi better hai, kuch mat karo
 
         print(f"🧩 DBSCAN se {len(cluster_groups)} cluster(s) bane is run me (EPS={EPS})")
 
@@ -1141,7 +1256,6 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
         removed_side_count = 0
         merged_count = 0
 
-        # 🆕 Existing persons load karo (pehle se ban chuke subfolders ke embeddings)
         folder_doc_for_match = Folder.objects(id=folderId).first()
         existing_people = []
         if folder_doc_for_match:
@@ -1159,7 +1273,6 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
 
             representative_embedding = compute_cluster_embedding(group_data)
 
-            # 🆕 DEBUG: batao ye cluster kaunsi group_id hai aur kitni images hain
             print(f"\n--- Processing cluster group_id={group_id} | images_in_cluster={len(group_data['images'])} | is_side={group_data['best_is_side']} ---")
 
             matched_sub_id = find_matching_person(representative_embedding, existing_people)
@@ -1217,9 +1330,13 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                 print(f"🖼️ FOLDER CROP VARIANCE = {_final_variance:.2f} (group_id={group_id})")
             except Exception as _e:
                 print(f"⚠️ Folder crop variance check failed: {_e}")
-            
+
             person_id = str(uuid.uuid4())
-            crop_key, crop_url = upload_face_crop(group_data["best_crop"], folderId, person_id)
+            crop_key, crop_url = upload_face_crop(
+                group_data["best_display_crop"],
+                folderId,
+                person_id
+            )
             sub_id = str(bson.ObjectId())
 
             try:
@@ -1234,22 +1351,18 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
             except Exception as e:
                 print(f"❌ Failed Bulk Tagging for Subfolder {sub_id}: {str(e)}")
 
-            # 2. Check Tagged Count from DB
             actual_tagged_count = WebLinks.objects(folderIds=sub_id).count()
             print(f"📊 Subfolder {sub_id} tagged count: {actual_tagged_count}")
 
-            # 3. Filter Check: Side Face + Count <= 2
             if group_data["best_is_side"] is True and actual_tagged_count <= 2:
                 removed_side_count += 1
                 print(f"🔍 SIDE-FACE FILTER (Count={actual_tagged_count}): Deleting crop & untagging subfolder {sub_id}")
 
-                # Delete Crop from S3
                 try:
                     s3.delete_object(Bucket=S3_BUCKET, Key=crop_key)
                 except Exception as s3_err:
                     print(f"⚠️ S3 delete failed for {sub_id}: {s3_err}")
 
-                # Untag WebLinks
                 try:
                     WebLinks.objects(folderIds=sub_id).update(pull__folderIds=sub_id)
                 except Exception as tag_err:
@@ -1273,7 +1386,6 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                 )
                 valid_subfolders.append(subfolder)
 
-                # 🆕 isi run ke andar bhi aage ke clusters isse match kar sakein
                 existing_people.append({
                     "sub_id": sub_id,
                     "embedding": representative_embedding
@@ -1297,7 +1409,6 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
         folder_doc.totalPersonCount = current_ai_person_count + len(valid_subfolders)
         folder_doc.uniqueFaceCount = (folder_doc.uniqueFaceCount or 0) + len(valid_subfolders)
 
-        # 🆕 Existing (merged) subfolders ka personCount bhi persist karo
         if folder_doc_for_match:
             updated_counts = {str(sf._id): sf.personCount for sf in folder_doc_for_match.subFolders}
             updated_embeddings = {str(sf._id): getattr(sf, "embedding", None) for sf in folder_doc_for_match.subFolders}
@@ -1308,15 +1419,12 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                 if updated_embeddings.get(sid):
                     sf.embedding = updated_embeddings[sid]
 
-
         folder_doc.save()
         print("✅ Folder Database Setup Success - All verified subfolders saved to DB")
 
         # =========================================================
         # STAGE 5: BANNER GENERATION
         # =========================================================
-        # 🆕 Pending flag check karo — ho sakta hai kisi skip hui call
-        # ka isLastBatch=True yahin store hua ho (lock busy hone ki wajah se)
         folder_doc_check = Folder.objects(id=folderId).first()
         pending_flag = getattr(folder_doc_check, "pendingLastBatch", False) if folder_doc_check else False
 
@@ -1327,17 +1435,13 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                 set__clusteringStatus="DONE"
             )
 
-            # Purane image_keys mein naye images nahi honge (wo tab fetch
-            # hue the jab ye run start hua tha). Isliye S3 se fresh poori
-            # list dobara nikaal kar isi function ko dobara call karo —
-            # ye naya run hi clustering + banner dono handle karega.
             fresh_image_keys = list_s3_images(folder_name)
             print(f"🔁 Fresh re-run: {len(fresh_image_keys)} images found in S3")
 
             process_face_clustering_in_background(
                 fresh_image_keys, folderId, userId, folder_name, isLastBatch=True
             )
-            return   # is (purane) run ka kaam yahin khatam — naya run banner bhi banayega
+            return
 
         if isLastBatch:
             print("🎨 Last batch received, generating banner...")
@@ -1405,7 +1509,6 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
             else:
                     print("⚠️ Banner generation failed")
 
-
         else:
             Folder.objects(id=folderId).update_one(
                 set__clusteringStatus="DONE"
@@ -1417,8 +1520,6 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
         Folder.objects(id=folderId).update_one(
             set__clusteringStatus="FAILED"
         )
-
-
  
 @app.post("/count-unique-persons")
 async def count_unique_persons(
