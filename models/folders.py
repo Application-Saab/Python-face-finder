@@ -141,6 +141,8 @@ class Folder(Document):
 
     orderId = StringField()
 
+    selectedForBanner = StringField(default="")
+
     subFolders = EmbeddedDocumentListField(
         SubFolder,
         default=list

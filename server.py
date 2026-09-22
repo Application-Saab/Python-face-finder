@@ -989,6 +989,10 @@ def generate_and_save_folder_banner(folderId: str) -> dict:
             if banner_doc:
                 banner_url = banner_doc.thumbnailImageUrl or banner_doc.originalUrl
 
+                folder_doc.selectedForBanner = banner_doc.thumbnailImageUrl or banner_doc.originalUrl
+                folder_doc.updatedAt = datetime.utcnow()
+                folder_doc.save()
+
         if banner_url:
             return {"success": True, "bannerUrl": banner_url, "selectedKey": selected_banner_key}
         
