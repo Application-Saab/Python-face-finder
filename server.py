@@ -11,8 +11,9 @@ from insightface.app import FaceAnalysis
 from numpy.linalg import norm
 import numpy as np
 import os
+import glob
 import asyncio
-from PIL import Image
+from PIL import Image, ImageOps
 import io
 from fastapi import UploadFile, File, Form, HTTPException, FastAPI
 import boto3
@@ -30,20 +31,17 @@ from fastapi import BackgroundTasks
 from database import connect_db
 from dotenv import load_dotenv
 load_dotenv()
-from fastapi import BackgroundTasks
-from fastapi import Form, HTTPException
 from eventFaceFinder import router as event_router
-import gc 
-from datetime import datetime
+import gc
 import requests
 import bson
-from mongoengine.queryset.visitor import Q  
+from mongoengine.queryset.visitor import Q
 import torch
 import open_clip
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 
-s3_client = boto3.client('s3') 
+s3_client = boto3.client('s3')
 BUCKET_NAME = "photography-hora"
 AWS_REGION = os.getenv("AWS_REGION", "eu-north-1")
 S3_BUCKET = os.getenv("S3_BUCKET_NAME", "photography-hora")
@@ -63,18 +61,12 @@ EXECUTOR = ThreadPoolExecutor(max_workers=3)
 
 app = FastAPI(title="Face Recognition Server", version="1.0.0")
 
+
+# =====================================================================
+#  ORIENTATION SECTION (NAYA - CLIP + face axis)
+# =====================================================================
 ORIENTATION_ANGLES = [0, 90, 180, 270]
-
 ORIENTATION_MIN_FACE_SCORE = 0.50
-ORIENTATION_MIN_CONFIDENCE = 0.65
-ORIENTATION_MIN_MARGIN = 0.08
-
-EXIF_ORIENTATION_TO_ROTATION = {
-    1: 0,
-    3: 180,
-    6: 90,
-    8: 270,
-}
 
 
 def resize_for_orientation_detection(image, max_size=1600):
@@ -101,28 +93,18 @@ def resize_for_orientation_detection(image, max_size=1600):
 
 def rotate_for_orientation(image, angle):
     """
-    OpenCV rotation.
+    angle = CLOCKWISE rotation (Node ke sharp.rotate(angle) jaisa).
     """
+    angle = angle % 360
     if angle == 0:
         return image
-
     if angle == 90:
         return cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
-
     if angle == 180:
         return cv2.rotate(image, cv2.ROTATE_180)
-
     if angle == 270:
         return cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
-
     return image
-
-ORIENTATION_ANGLES = [0, 90, 180, 270]
-
-ORIENTATION_MIN_FACE_SCORE = 0.50
-ORIENTATION_MIN_CONFIDENCE = 0.65
-ORIENTATION_MIN_MARGIN = 0.08
-ORIENTATION_ZERO_BIAS_MARGIN = 0.03
 
 
 def calculate_face_upright_score(face):
@@ -195,189 +177,149 @@ def calculate_face_upright_score(face):
 
 def score_orientation_angle(image, angle):
     """
-    Ek angle ko test karta hai.
+    Ek angle pe faces test karta hai (sirf axis ke prior ke liye use hota hai).
     """
     rotated = rotate_for_orientation(image, angle)
-
     faces = searcher.app.get(rotated)
 
     valid_faces = []
-
     for face in faces:
         detection_score = float(getattr(face, "det_score", 0))
-
         if detection_score < ORIENTATION_MIN_FACE_SCORE:
             continue
-
         orientation_score = calculate_face_upright_score(face)
-
         valid_faces.append({
             "detection": detection_score,
-            "orientation": orientation_score
+            "orientation": float(orientation_score),
         })
 
     if not valid_faces:
         return {"angle": angle, "score": 0.0, "faces": 0, "weighted_total": 0.0}
 
-    scores = [item["orientation"] for item in valid_faces]
-    average_score = float(np.mean(scores))
-    weighted_total = float(sum(
-        item["detection"] * item["orientation"] for item in valid_faces
-    ))
-
+    scores = [f["orientation"] for f in valid_faces]
     return {
         "angle": angle,
-        "score": average_score,
+        "score": float(np.mean(scores)),
         "faces": len(valid_faces),
-        "weighted_total": weighted_total
+        "weighted_total": float(sum(f["detection"] * f["orientation"] for f in valid_faces)),
     }
 
-ORIENTATION_ZERO_BIAS_WEIGHTED_MARGIN = 0.10
+
+# ---------- CLIP zero-shot direction (NO TRAINING, server pe koi file save nahi hoti) ----------
+_ANGLES = [0, 90, 180, 270]
+_EMBED_MAX_SIDE = 512
+ORIENTATION_MIN_CONFIDENCE_COMBINED = 0.45   # isse kam confidence = rotate nahi karenge
+
+# Real-world prior: camera ulta (180) bahut kam pakda jata hai, isliye 180 ko
+# tabhi choose karo jab CLIP bahut sure ho. 90 vs 270 ke liye tumhare logs me
+# 270 zyada common tha. Ye numbers tune kar sakti ho.
+ORIENTATION_PRIOR = {0: 1.0, 90: 0.6, 180: 0.2, 270: 1.0}
+
+_ZS_UP = [
+    "a normal, correctly oriented photograph",
+    "a photo where people are standing upright with their heads at the top",
+    "a photo with the sky at the top and the ground at the bottom",
+]
+_ZS_BAD = [
+    "an upside down photograph",
+    "a photo rotated sideways by 90 degrees",
+    "a photo where people are lying sideways",
+    "a photo with the ground at the top and the sky at the bottom",
+]
+_zs_text = None
+
+
+def _get_clip():
+    """Wahi CLIP model jo neeche file me load hota hai (dobara load nahi hota)."""
+    return _clip_model, _clip_preprocess
+
+
+def _shrink(bgr, max_side=_EMBED_MAX_SIDE):
+    h, w = bgr.shape[:2]
+    s = max_side / max(h, w)
+    if s < 1:
+        bgr = cv2.resize(bgr, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
+    return bgr
+
+
+@torch.no_grad()
+def _clip_embed(bgr_list):
+    model, preprocess = _get_clip()
+    batch = []
+    for im in bgr_list:
+        rgb = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
+        batch.append(preprocess(Image.fromarray(rgb)))
+    x = torch.stack(batch).to(_CLIP_DEVICE)
+    f = model.encode_image(x).float()
+    f = f / f.norm(dim=-1, keepdim=True)
+    return f.cpu().numpy()
+
+
+def _zero_shot_probs(image):
+    """returns {angle: prob}. prob[a] = image ko 'a' se rotate karne par wo seedhi dikhegi."""
+    global _zs_text
+    model, _ = _get_clip()
+    if _zs_text is None:
+        with torch.no_grad():
+            up = model.encode_text(_clip_tokenizer(_ZS_UP).to(_CLIP_DEVICE)).float()
+            bad = model.encode_text(_clip_tokenizer(_ZS_BAD).to(_CLIP_DEVICE)).float()
+            up = up / up.norm(dim=-1, keepdim=True)
+            bad = bad / bad.norm(dim=-1, keepdim=True)
+            _zs_text = (up, bad)
+    up, bad = _zs_text
+
+    small = _shrink(image)
+    feats = _clip_embed([rotate_for_orientation(small, a) for a in _ANGLES])
+    f = torch.from_numpy(feats).to(_CLIP_DEVICE)
+    logits = ((f @ up.T).mean(dim=1) - (f @ bad.T).mean(dim=1)) * 100.0
+    p = torch.softmax(logits, dim=0).cpu().numpy()
+    return {a: float(p[i]) for i, a in enumerate(_ANGLES)}
 
 
 def detect_image_orientation(image, content_bytes=None):
-    """
-    0 / 90 / 180 / 270 sab test karke
-    best upright orientation choose karta hai.
-
-    NOTE: DSLR cameras (jaise ye wedding shoot) mein zyadatar
-    gyroscope/orientation sensor nahi hota, isliye EXIF Orientation
-    tag hamesha ek fixed default value likhta hai — chahe photo
-    kisi bhi angle pe khinchi gayi ho. Isliye EXIF ko face-detection
-    ke against "conflict override" ke liye use NAHI karte.
-    EXIF sirf tab use hota hai jab face bilkul na mile (last resort).
-    """
-
     image = resize_for_orientation_detection(image, max_size=1600)
 
-    candidates = []
-    for angle in ORIENTATION_ANGLES:
-        result = score_orientation_angle(image, angle)
-        candidates.append(result)
+    candidates = [score_orientation_angle(image, a) for a in ORIENTATION_ANGLES]
 
-    zero_candidate = next(c for c in candidates if c["angle"] == 0)
+    p_clip = _zero_shot_probs(image)
+    face = {c["angle"]: c["score"] for c in candidates}
+    any_face = any(c["faces"] > 0 for c in candidates)
 
-    candidates.sort(key=lambda x: x["weighted_total"], reverse=True)
+    combined = {}
+    for a in _ANGLES:
+        # face score sirf axis filter (0/180 vs 90/270) ka kaam karta hai
+        face_prior = (0.15 + face.get(a, 0.0)) ** 2 if any_face else 1.0
+        combined[a] = p_clip[a] * face_prior * ORIENTATION_PRIOR[a]
 
-    best = candidates[0]
-    second = candidates[1] if len(candidates) > 1 else None
+    total = sum(combined.values()) or 1.0
+    probs = {a: v / total for a, v in combined.items()}
+    best = max(probs, key=probs.get)
+    conf = probs[best]
 
-    best_score = best["score"]
-    second_score = second["score"] if second else 0
-    margin = best_score - second_score
-
-    if best["angle"] != 0 and zero_candidate["faces"] > 0:
-        weighted_gap = best["weighted_total"] - zero_candidate["weighted_total"]
-
-        if weighted_gap < ORIENTATION_ZERO_BIAS_WEIGHTED_MARGIN:
-            print(
-                f"⚠️ Best={best['angle']}° (weighted={best['weighted_total']:.4f}) "
-                f"but 0° weighted is close (weighted={zero_candidate['weighted_total']:.4f}) "
-                f"-> keeping 0°, not rotating"
-            )
-            best = zero_candidate
-            best_score = zero_candidate["score"]
-            remaining = [c for c in candidates if c["angle"] != 0]
-            second = remaining[0] if remaining else None
-            second_score = second["score"] if second else 0
-            margin = best_score - second_score
-        else:
-            print(
-                f"✅ Best={best['angle']}° weighted_total ({best['weighted_total']:.4f}) "
-                f"clearly beats 0° ({zero_candidate['weighted_total']:.4f}) -> trusting {best['angle']}°"
-            )
-
-    has_exif = False
-    exif_rotation = 0
-    if content_bytes is not None:
-        has_exif, exif_rotation = get_exif_rotation(content_bytes)
+    if conf < ORIENTATION_MIN_CONFIDENCE_COMBINED:
+        rotation, reason = 0, "low_confidence_keep_0"
+    else:
+        rotation, reason = best, "clip_zero_shot_plus_face_axis"
 
     print("\n==============================")
     print("ORIENTATION RESULT")
     print("==============================")
-    print("Candidates:", candidates)
-    print("Best Angle (face-based):", best["angle"])
-    print("Best Score:", round(best_score, 4))
-    print("Second Score:", round(second_score, 4))
-    print("Margin:", round(margin, 4))
-    print("Has EXIF tag:", has_exif, "| EXIF Rotation:", exif_rotation)
+    print("CLIP probs    :", {k: round(v, 3) for k, v in p_clip.items()})
+    print("Face scores   :", {k: round(v, 3) for k, v in face.items()})
+    print("Combined probs:", {k: round(v, 3) for k, v in probs.items()})
+    print(f"FINAL rotation: {rotation}° | conf={conf:.3f} | {reason}")
 
-    if best["faces"] == 0:
-        if has_exif and exif_rotation != 0:
-            print(f"📐 No face, EXIF says {exif_rotation}° -> using EXIF (last resort)")
-            return {
-                "rotation": exif_rotation,
-                "confidence": 0,
-                "faces": 0,
-                "autoRotated": True,
-                "reason": "no_face_exif_fallback",
-                "candidates": candidates
-            }
-
-        print("⚠️ No face detected & no EXIF hint -> rotation 0")
-        return {
-            "rotation": 0,
-            "confidence": 0,
-            "faces": 0,
-            "autoRotated": False,
-            "reason": "no_face_detected",
-            "candidates": candidates
-        }
-
-    if best_score < ORIENTATION_MIN_CONFIDENCE:
-        print("⚠️ Low confidence -> rotation 0")
-        return {
-            "rotation": 0,
-            "confidence": round(best_score, 4),
-            "faces": best["faces"],
-            "autoRotated": False,
-            "reason": "low_confidence",
-            "candidates": candidates
-        }
-
-    if margin < ORIENTATION_MIN_MARGIN:
-        print("⚠️ Ambiguous orientation")
-        print(f"⚠️ But using best candidate: {best['angle']}°")
-        return {
-            "rotation": best["angle"],
-            "confidence": round(best_score, 4),
-            "faces": best["faces"],
-            "autoRotated": best["angle"] != 0,
-            "reason": "ambiguous_best_candidate_used",
-            "candidates": candidates
-        }
-
-    print(f"✅ Orientation detected: {best['angle']}°")
+    best_faces = next((c["faces"] for c in candidates if c["angle"] == rotation), 0)
     return {
-        "rotation": best["angle"],
-        "confidence": round(best_score, 4),
-        "faces": best["faces"],
-        "autoRotated": best["angle"] != 0,
-        "reason": "orientation_detected",
-        "candidates": candidates
+        "rotation": rotation,
+        "confidence": round(conf, 4),
+        "faces": best_faces,
+        "autoRotated": rotation != 0,
+        "reason": reason,
+        "candidates": candidates,
+        "clipProbs": {str(k): round(v, 4) for k, v in p_clip.items()},
     }
 
-
-def get_exif_rotation(content_bytes):
-    """
-    Returns (has_tag: bool, rotation: int)
-    EXIF Orientation tag missing hone par has_tag=False —
-    taaki "tag missing" ko "genuine 0" na samjha jaye.
-    """
-    try:
-        img = Image.open(io.BytesIO(content_bytes))
-        exif = img.getexif()
-        orientation_tag = exif.get(274)  
-
-        if orientation_tag is None:
-            return False, 0
-
-        rotation = EXIF_ORIENTATION_TO_ROTATION.get(orientation_tag, 0)
-        return True, rotation
-
-    except Exception as e:
-        print(f"⚠️ EXIF read error: {e}")
-        return False, 0
 
 @app.post("/detect-orientation")
 async def detect_orientation_api(file: UploadFile = File(...)):
@@ -388,46 +330,32 @@ async def detect_orientation_api(file: UploadFile = File(...)):
         print("===================================")
 
         content = await file.read()
-
         array = np.frombuffer(content, dtype=np.uint8)
-        image = cv2.imdecode(
-            array,
-            cv2.IMREAD_IGNORE_ORIENTATION | cv2.IMREAD_COLOR
-        )
+        image = cv2.imdecode(array, cv2.IMREAD_IGNORE_ORIENTATION | cv2.IMREAD_COLOR)
 
         if image is None:
             return {
-                "success": False,
-                "filename": file.filename,
-                "rotation": 0,
-                "confidence": 0,
-                "autoRotated": False,
-                "reason": "invalid_image"
+                "success": False, "filename": file.filename, "rotation": 0,
+                "confidence": 0, "autoRotated": False, "reason": "invalid_image",
             }
 
         print("Original image size:", image.shape[1], "x", image.shape[0])
 
         result = detect_image_orientation(image, content_bytes=content)
-
-        return {
-            "success": True,
-            "filename": file.filename,
-            **result
-        }
+        return {"success": True, "filename": file.filename, **result}
 
     except Exception as error:
         print("❌ ORIENTATION API ERROR:", str(error))
         return {
-            "success": False,
-            "filename": file.filename,
-            "rotation": 0,
-            "confidence": 0,
-            "faces": 0,
-            "autoRotated": False,
-            "reason": "python_error",
-            "error": str(error)
+            "success": False, "filename": file.filename, "rotation": 0,
+            "confidence": 0, "faces": 0, "autoRotated": False,
+            "reason": "python_error", "error": str(error),
         }
 
+
+# =====================================================================
+#  ORIENTATION SECTION END
+# =====================================================================
 
 
 app.add_middleware(
@@ -439,7 +367,7 @@ app.add_middleware(
 )
 
 app.include_router(event_router)
-        
+
 
 def delete_subfolder_by_id(subfolder_id: str):
     try:
@@ -507,9 +435,9 @@ class FaceSearcher:
         SCAN_LIMIT = 3
 
         download_sem = asyncio.Semaphore(DOWNLOAD_LIMIT)
-        scan_sem = asyncio.Semaphore(SCAN_LIMIT) 
+        scan_sem = asyncio.Semaphore(SCAN_LIMIT)
 
-         
+
         batches = [
             image_keys[i : i + BATCH_SIZE]
             for i in range(0, len(image_keys), BATCH_SIZE)
@@ -520,7 +448,7 @@ class FaceSearcher:
         tasks = []
         match_count = 0
 
-        
+
         for batch_id, keys in enumerate(batches, start=1):
 
             async def handle_batch(
@@ -547,7 +475,7 @@ class FaceSearcher:
 
                 batch_imgs = list(zip(keys, imgs))
 
-                
+
                 async with scan_sem:
                     print(
                         f"[{ts()}] 🔍 Batch-{batch_id} "
@@ -574,7 +502,7 @@ class FaceSearcher:
 
             tasks.append(asyncio.create_task(handle_batch()))
 
-        
+
         for coro in asyncio.as_completed(tasks):
             batch_id, results = await coro
 
@@ -606,7 +534,7 @@ class FaceSearcher:
 def list_s3_images(prefix: str) -> List[str]:
     """
     Return list of S3 object keys under a prefix
-    that are ⁠ .webp ⁠ images and contain ⁠ /thumb_ ⁠.
+    that are .webp images and contain /thumb_ .
     """
     keys = []
     paginator = s3.get_paginator("list_objects_v2")
@@ -684,7 +612,7 @@ async def startup_event():
 async def health_check():
     """Health check endpoint."""
     return {"status": "ok", "timestamp": ts()}
-   
+
 @app.post("/search")
 async def search_faces_s3(
     sample_image: UploadFile = File(...),
@@ -754,9 +682,9 @@ def find_vips_using_cooccurrence(person_clusters: list, total_images_count: int)
         return []
 
     sorted_groups = sorted(person_clusters, key=lambda x: x["count"], reverse=True)
-    
+
     min_photos_threshold = max(int(total_images_count * 0.10), 10)
-    
+
     p1_group = sorted_groups[0]
     if p1_group["count"] < min_photos_threshold:
         return [p1_group]
@@ -769,12 +697,12 @@ def find_vips_using_cooccurrence(person_clusters: list, total_images_count: int)
     for candidate in candidates:
         if candidate["count"] < min_photos_threshold:
             continue
-        
+
         candidate_images = set(candidate["images"])
-        
+
         shared_photos = p1_images.intersection(candidate_images)
         shared_count = len(shared_photos)
-        
+
         co_occurrence_ratio = shared_count / float(candidate["count"])
         shared_with_p1_ratio = shared_count / float(p1_group["count"])
 
@@ -786,7 +714,7 @@ def find_vips_using_cooccurrence(person_clusters: list, total_images_count: int)
         if co_occurrence_ratio >= 0.25 or shared_with_p1_ratio >= 0.15:
             vip_groups.append(candidate)
             print(f"   ✅ CONFIRMED VIP: {candidate['folderName']}")
-            
+
             if len(vip_groups) >= 3:
                 break
         else:
@@ -828,7 +756,7 @@ def get_best_banner_image(image_keys: list, expected_vip_count: int) -> str:
                 height, width, _ = img.shape
                 aspect_ratio = width / float(height)
 
-                if aspect_ratio < 1.1: 
+                if aspect_ratio < 1.1:
                     del img_bytes, nparr, img
                     continue
 
@@ -837,22 +765,22 @@ def get_best_banner_image(image_keys: list, expected_vip_count: int) -> str:
                 megapixels = (width * height) / 1000000.0
 
                 faces = face_cascade.detectMultiScale(
-                    gray, 
-                    scaleFactor=1.1, 
-                    minNeighbors=5, 
+                    gray,
+                    scaleFactor=1.1,
+                    minNeighbors=5,
                     minSize=(20, 20)
                 )
                 detected_faces_count = len(faces)
 
                 if detected_faces_count == expected_vip_count:
-                    face_score_multiplier = 2.0 
+                    face_score_multiplier = 2.0
                 elif detected_faces_count > expected_vip_count:
                     extra_faces = detected_faces_count - expected_vip_count
                     face_score_multiplier = max(0.2, 1.0 - (extra_faces * 0.3))
                 else:
                     face_score_multiplier = 0.5 if detected_faces_count > 0 else 0.2
 
-                aspect_ratio_multiplier = min(aspect_ratio, 1.8) 
+                aspect_ratio_multiplier = min(aspect_ratio, 1.8)
                 score = ((sharpness * 0.6) + (megapixels * 20.0)) * face_score_multiplier * aspect_ratio_multiplier
 
                 if score > best_score:
@@ -884,7 +812,7 @@ def filter_strict_vip_photos(candidate_keys: list, exact_vip_count: int) -> tupl
 
     if strict_candidates:
         return strict_candidates, True
-    
+
     return candidate_keys, False
 
 
@@ -923,7 +851,7 @@ def generate_and_save_folder_banner(folderId: str) -> dict:
         for sub in person_subfolders:
             sub_id = str(sub._id)
             links = WebLinks.objects(folderIds=sub_id)
-            
+
             valid_links = []
             for link in links:
                 key = link.originalKey or link.thumbnailKey
@@ -995,33 +923,34 @@ def generate_and_save_folder_banner(folderId: str) -> dict:
 
         if banner_url:
             return {"success": True, "bannerUrl": banner_url, "selectedKey": selected_banner_key}
-        
+
         return {"success": False, "message": "Banner key found but URL missing"}
 
     except Exception as e:
         print(f"❌ Error in generate_and_save_folder_banner: {str(e)}")
         return {"success": False, "error": str(e)}
 
-    
+
 EPS = 0.6
 MIN_SAMPLES = 2
-MERGE_THRESHOLD = 0.50  
+MERGE_THRESHOLD = 0.50
 STALE_LOCK_MINUTES = 15
 BLUR_THRESHOLD = 300.0
- 
- 
+
+
 # =====================================================================
-# NAYA ADDITION #1: CLIP model ek hi baar yaha load hota hai (file ke
-# top pe, function ke bahar) — taaki har baar dubara load na ho.
+# CLIP model ek hi baar yaha load hota hai (file ke top pe, function ke
+# bahar) — taaki har baar dubara load na ho. Orientation bhi isi ko use
+# karta hai (_get_clip()).
 # =====================================================================
 _CLIP_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
- 
+
 _clip_model, _, _clip_preprocess = open_clip.create_model_and_transforms(
     "ViT-B-32", pretrained="openai"
 )
 _clip_model.eval().to(_CLIP_DEVICE)
 _clip_tokenizer = open_clip.get_tokenizer("ViT-B-32")
- 
+
 _REAL_PROMPTS = [
     "a photo of a real human face",
     "a close-up photograph of a person's face",
@@ -1040,28 +969,28 @@ _FAKE_PROMPTS = [
     "a costume or animal mask face",
     "a toy or action figure face",
 ]
- 
+
 with torch.no_grad():
     _real_tok = _clip_tokenizer(_REAL_PROMPTS).to(_CLIP_DEVICE)
     _fake_tok = _clip_tokenizer(_FAKE_PROMPTS).to(_CLIP_DEVICE)
- 
+
     _real_emb = _clip_model.encode_text(_real_tok)
     _fake_emb = _clip_model.encode_text(_fake_tok)
- 
+
     _real_emb = _real_emb / _real_emb.norm(dim=-1, keepdim=True)
     _fake_emb = _fake_emb / _fake_emb.norm(dim=-1, keepdim=True)
- 
+
     _REAL_ANCHOR = _real_emb.mean(dim=0, keepdim=True)
     _FAKE_ANCHOR = _fake_emb.mean(dim=0, keepdim=True)
     _REAL_ANCHOR = _REAL_ANCHOR / _REAL_ANCHOR.norm(dim=-1, keepdim=True)
     _FAKE_ANCHOR = _FAKE_ANCHOR / _FAKE_ANCHOR.norm(dim=-1, keepdim=True)
- 
+
 REAL_FACE_THRESHOLD = 0.68  # apne data pe test karke adjust karein
- 
- 
+
+
 # =====================================================================
-# NAYA ADDITION #2: batched filter function — ek image-batch ke saare
-# faces ek saath check karta hai, isliye slow nahi hota.
+# batched filter function — ek image-batch ke saare faces ek saath
+# check karta hai, isliye slow nahi hota.
 # =====================================================================
 def is_real_human_face_batch(face_crops, threshold=REAL_FACE_THRESHOLD, batch_size=64):
     """
@@ -1070,33 +999,33 @@ def is_real_human_face_batch(face_crops, threshold=REAL_FACE_THRESHOLD, batch_si
     """
     results = [None] * len(face_crops)
     valid_idx = [i for i, c in enumerate(face_crops) if c is not None and c.size > 0]
- 
+
     for start in range(0, len(valid_idx), batch_size):
         chunk_idx = valid_idx[start:start + batch_size]
         tensors = torch.stack(
             [_clip_preprocess(Image.fromarray(face_crops[i])) for i in chunk_idx]
         ).to(_CLIP_DEVICE)
- 
+
         with torch.no_grad():
             img_emb = _clip_model.encode_image(tensors)
             img_emb = img_emb / img_emb.norm(dim=-1, keepdim=True)
- 
+
             real_sim = (img_emb @ _REAL_ANCHOR.T).squeeze(-1)
             fake_sim = (img_emb @ _FAKE_ANCHOR.T).squeeze(-1)
- 
+
             stacked = torch.stack([real_sim, fake_sim], dim=1) * 100
             probs = torch.softmax(stacked, dim=1)[:, 0]
- 
+
         for local_i, global_i in enumerate(chunk_idx):
             score = float(probs[local_i])
             results[global_i] = (score >= threshold, score)
- 
+
     for i in range(len(face_crops)):
         if results[i] is None:
             results[i] = (False, 0.0)
- 
+
     return results
- 
+
 def upload_face_crop(face_crop, folder_id, person_id):
     h, w = face_crop.shape[:2]
     MIN_DP_SIZE = 250
@@ -1148,28 +1077,28 @@ def is_side_face(face_obj):
             yaw = abs(pose[1])  # Yaw = Head rotation angle (Left/Right)
             if yaw > 22.0:      # 22 degree se zyaada tilted face ko side face maano
                 return True
- 
+
         # 2️⃣ Keypoint (Landmark) Asymmetry Check
         kps = getattr(face_obj, 'kps', None)
         if kps is None or len(kps) < 5:
             # Agar landmarks clearly detect nahi hue (extreme side profile)
             return True
- 
+
         left_eye, right_eye, nose = kps[0], kps[1], kps[2]
- 
+
         dist_left = np.linalg.norm(nose - left_eye)
         dist_right = np.linalg.norm(nose - right_eye)
- 
+
         max_dist = max(dist_left, dist_right)
         if max_dist == 0:
             return True
- 
+
         asymmetry_ratio = abs(dist_left - dist_right) / max_dist
- 
+
         # 💡 Threshold ko 0.32 se ghata kar 0.20 kar diya hai
         # Cropped Face DPs me 20% asymmetry ka matlab clearly Profile / Side Face hai
         return asymmetry_ratio > 0.20
- 
+
     except Exception as e:
         print(f"⚠️ is_side_face check failed: {e}")
         return False
@@ -1185,7 +1114,7 @@ def is_smiling_face(face_crop):
     """
     try:
         gray = cv2.cvtColor(face_crop, cv2.COLOR_RGB2GRAY)
-        gray = cv2.equalizeHist(gray)  
+        gray = cv2.equalizeHist(gray)
         smiles = _SMILE_CASCADE.detectMultiScale(
             gray,
             scaleFactor=1.7,
@@ -1209,7 +1138,7 @@ def sharpen_crop(img):
     except Exception:
         return img
 
-    
+
 def is_blurry_face(face_crop, threshold=BLUR_THRESHOLD):
     try:
         gray = cv2.cvtColor(face_crop, cv2.COLOR_RGB2GRAY)
@@ -1352,41 +1281,41 @@ def try_acquire_clustering_lock(folderId, isLastBatch=False):
 
     print(f"⏩ SKIPPING trigger for folder {folderId} — clustering already IN_PROGRESS")
     return False
- 
- 
+
+
 def cleanup_small_side_face_folders(folderId):
     try:
         folder_doc = Folder.objects(id=folderId).first()
         if not folder_doc:
             print("❌ Folder not found in cleanup")
             return
- 
+
         subfolders_to_keep = []
         removed_count = 0
- 
+
         for subfolder in folder_doc.subFolders:
             if not subfolder.isPersonFolder:
                 subfolders_to_keep.append(subfolder)
                 continue
- 
+
             sub_id = str(subfolder._id)
- 
+
             # ✅ Live/real-time tagged count — WebLinks DB se (source of truth)
             actual_tagged_count = WebLinks.objects(folderIds=sub_id).count()
- 
+
             is_side = getattr(subfolder, "isSideFace", None)
             should_delete = False
- 
+
             # 🎯 Core Requirement: isSideFace == True AND tagged count <= 2
             if is_side is True and actual_tagged_count <= 2:
                 should_delete = True
                 print(f"🔍 SIDE-FACE (Count={actual_tagged_count}): Deleting subfolder {sub_id}")
- 
+
             # Final Action Block
             if should_delete:
                 removed_count += 1
                 s3_key = getattr(subfolder.folderDp, "s3Key", None) if subfolder.folderDp else None
- 
+
                 # 1. Delete S3 Crop Image
                 if s3_key:
                     try:
@@ -1394,19 +1323,19 @@ def cleanup_small_side_face_folders(folderId):
                         print(f"🗑️ S3 crop deleted: {s3_key}")
                     except Exception as s3_err:
                         print(f"⚠️ S3 delete failed for {sub_id}: {s3_err}")
- 
+
                 # 2. Untag WebLinks DB
                 try:
                     WebLinks.objects(folderIds=sub_id).update(pull__folderIds=sub_id)
                 except Exception as tag_err:
                     print(f"⚠️ Untagging failed for {sub_id}: {tag_err}")
- 
+
                 print(f"🗑️ SUCCESSFULLY REMOVED Side-Face Folder (ID: {sub_id}, Tagged Count: {actual_tagged_count})")
             else:
                 # Keep folder and sync real count
                 subfolder.personCount = actual_tagged_count
                 subfolders_to_keep.append(subfolder)
- 
+
         # Database update if any folder removed
         if removed_count > 0:
             folder_doc.subFolders = subfolders_to_keep
@@ -1415,11 +1344,11 @@ def cleanup_small_side_face_folders(folderId):
             print(f"✅ Cleanup completed — Total {removed_count} side-face folder(s) removed.")
         else:
             print("✅ Cleanup completed — No side-face folders with <=2 images found.")
- 
+
     except Exception as e:
         print(f"❌ Error in cleanup_small_side_face_folders: {str(e)}")
- 
- 
+
+
 def process_face_clustering_in_background(image_keys, folderId, userId, folder_name, isLastBatch=False):
     if not try_acquire_clustering_lock(folderId, isLastBatch):
         print(f"⏩ Background task SKIPPED for folder {folderId} — already in progress")
@@ -1536,7 +1465,7 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
         cluster_groups = {}
         noise_id_counter = -2
 
-        MIN_GOOD_FACE_SIZE = 90  
+        MIN_GOOD_FACE_SIZE = 90
 
         for label, metadata in zip(labels, face_metadata):
             if label == -1:
@@ -1889,7 +1818,7 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
         Folder.objects(id=folderId).update_one(
             set__clusteringStatus="FAILED"
         )
- 
+
 @app.post("/count-unique-persons")
 async def count_unique_persons(
     background_tasks: BackgroundTasks,
@@ -1900,16 +1829,16 @@ async def count_unique_persons(
 ):
     try:
         image_keys = list_s3_images(folder_name)
- 
+
         if not image_keys:
             print(f"⚠️ [API] No images found in S3 bucket for folder: {folder_name} (ID: {folderId})")
             return {"success": False, "message": "No images found in S3 bucket"}
- 
+
         # Folder doc se orderId aur folderName fetch kar rahe hain for logging
         folder_doc = Folder.objects(id=folderId).first()
         orderId = getattr(folder_doc, "orderId", "N/A") if folder_doc else "N/A"
         display_name = getattr(folder_doc, "folderName", folder_name) if folder_doc else folder_name
- 
+
         print("\n" + "📥" * 30)
         print(f"📌 [API RECEIVED] Count Unique Persons Triggered")
         print(f"📁 Folder Name : {display_name}")
@@ -1930,17 +1859,17 @@ async def count_unique_persons(
             folder_name,
             isLastBatch,
         )
- 
+
         return {
             "success": True,
             "message": "Face recognition and clustering started in background.",
             "totalPhotosFound": len(image_keys)
         }
- 
+
     except Exception as e:
         print(f"❌ [API ERROR] Failed to initialize face count: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-    
+
 @app.post("/api/test/generate-banner/{folder_id}")
 async def test_generate_banner_endpoint(folder_id: str):
     """Directly triggers banner scoring logic & Node.js API call only if eventId exists in the folder."""
@@ -1975,7 +1904,7 @@ async def test_generate_banner_endpoint(folder_id: str):
         node_res_data = None
         node_api_called = False
 
-        
+
 
         NODE_API_URL = "https://horaservices.com/api/internal/generate-banner"
 
@@ -1994,7 +1923,7 @@ async def test_generate_banner_endpoint(folder_id: str):
 
         image_bytes.close()
         node_api_called = True
-        
+
 
         return {
             "success": True,
@@ -2019,7 +1948,7 @@ async def test_generate_banner_endpoint(folder_id: str):
         print(f"❌ Error in test_generate_banner_endpoint: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-    
+
 # Serve index.html at root
 @app.get("/", response_class=HTMLResponse)
 async def serve_index():
@@ -2027,10 +1956,11 @@ async def serve_index():
     index_path = "index.html"
     if not os.path.exists(index_path):
         return HTMLResponse("<h1>index.html not found</h1>", status_code=404)
-    
+
     with open(index_path, "r", encoding="utf-8") as f:
         return HTMLResponse(f.read())
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
