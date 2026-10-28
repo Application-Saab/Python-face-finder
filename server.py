@@ -26,7 +26,7 @@ import uuid
 import cv2
 from sklearn.cluster import DBSCAN
 from fastapi import BackgroundTasks
-
+import glob
 from database import connect_db
 from dotenv import load_dotenv
 load_dotenv()
@@ -120,9 +120,7 @@ def rotate_for_orientation(image, angle):
 ORIENTATION_ANGLES = [0, 90, 180, 270]
 
 ORIENTATION_MIN_FACE_SCORE = 0.50
-ORIENTATION_MIN_CONFIDENCE = 0.65
-ORIENTATION_MIN_MARGIN = 0.08
-ORIENTATION_ZERO_BIAS_MARGIN = 0.03
+
 
 
 def calculate_face_upright_score(face):
@@ -195,189 +193,148 @@ def calculate_face_upright_score(face):
 
 def score_orientation_angle(image, angle):
     """
-    Ek angle ko test karta hai.
+    Ek angle pe faces test karta hai (sirf axis ke prior ke liye use hota hai).
     """
     rotated = rotate_for_orientation(image, angle)
-
     faces = searcher.app.get(rotated)
 
     valid_faces = []
-
     for face in faces:
         detection_score = float(getattr(face, "det_score", 0))
-
         if detection_score < ORIENTATION_MIN_FACE_SCORE:
             continue
-
         orientation_score = calculate_face_upright_score(face)
-
         valid_faces.append({
             "detection": detection_score,
-            "orientation": orientation_score
+            "orientation": float(orientation_score),
         })
 
     if not valid_faces:
         return {"angle": angle, "score": 0.0, "faces": 0, "weighted_total": 0.0}
 
-    scores = [item["orientation"] for item in valid_faces]
-    average_score = float(np.mean(scores))
-    weighted_total = float(sum(
-        item["detection"] * item["orientation"] for item in valid_faces
-    ))
-
+    scores = [f["orientation"] for f in valid_faces]
     return {
         "angle": angle,
-        "score": average_score,
+        "score": float(np.mean(scores)),
         "faces": len(valid_faces),
-        "weighted_total": weighted_total
+        "weighted_total": float(sum(f["detection"] * f["orientation"] for f in valid_faces)),
     }
 
-ORIENTATION_ZERO_BIAS_WEIGHTED_MARGIN = 0.10
+
+# ---------- CLIP zero-shot direction (NO TRAINING, server pe koi file save nahi hoti) ----------
+_ANGLES = [0, 90, 180, 270]
+_EMBED_MAX_SIDE = 512
+ORIENTATION_MIN_CONFIDENCE_COMBINED = 0.45   # isse kam confidence = rotate nahi karenge
+
+# Real-world prior: camera ulta (180) bahut kam pakda jata hai, isliye 180 ko
+# tabhi choose karo jab CLIP bahut sure ho. 90 vs 270 ke liye tumhare logs me
+# 270 zyada common tha. Ye numbers tune kar sakti ho.
+ORIENTATION_PRIOR = {0: 1.0, 90: 0.6, 180: 0.2, 270: 1.0}
+
+_ZS_UP = [
+    "a normal, correctly oriented photograph",
+    "a photo where people are standing upright with their heads at the top",
+    "a photo with the sky at the top and the ground at the bottom",
+]
+_ZS_BAD = [
+    "an upside down photograph",
+    "a photo rotated sideways by 90 degrees",
+    "a photo where people are lying sideways",
+    "a photo with the ground at the top and the sky at the bottom",
+]
+_zs_text = None
+
+
+def _get_clip():
+    """Wahi CLIP model jo neeche file me load hota hai (dobara load nahi hota)."""
+    return _clip_model, _clip_preprocess
+
+
+def _shrink(bgr, max_side=_EMBED_MAX_SIDE):
+    h, w = bgr.shape[:2]
+    s = max_side / max(h, w)
+    if s < 1:
+        bgr = cv2.resize(bgr, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
+    return bgr
+
+
+@torch.no_grad()
+def _clip_embed(bgr_list):
+    model, preprocess = _get_clip()
+    batch = []
+    for im in bgr_list:
+        rgb = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
+        batch.append(preprocess(Image.fromarray(rgb)))
+    x = torch.stack(batch).to(_CLIP_DEVICE)
+    f = model.encode_image(x).float()
+    f = f / f.norm(dim=-1, keepdim=True)
+    return f.cpu().numpy()
+
+
+def _zero_shot_probs(image):
+    """returns {angle: prob}. prob[a] = image ko 'a' se rotate karne par wo seedhi dikhegi."""
+    global _zs_text
+    model, _ = _get_clip()
+    if _zs_text is None:
+        with torch.no_grad():
+            up = model.encode_text(_clip_tokenizer(_ZS_UP).to(_CLIP_DEVICE)).float()
+            bad = model.encode_text(_clip_tokenizer(_ZS_BAD).to(_CLIP_DEVICE)).float()
+            up = up / up.norm(dim=-1, keepdim=True)
+            bad = bad / bad.norm(dim=-1, keepdim=True)
+            _zs_text = (up, bad)
+    up, bad = _zs_text
+
+    small = _shrink(image)
+    feats = _clip_embed([rotate_for_orientation(small, a) for a in _ANGLES])
+    f = torch.from_numpy(feats).to(_CLIP_DEVICE)
+    logits = ((f @ up.T).mean(dim=1) - (f @ bad.T).mean(dim=1)) * 100.0
+    p = torch.softmax(logits, dim=0).cpu().numpy()
+    return {a: float(p[i]) for i, a in enumerate(_ANGLES)}
 
 
 def detect_image_orientation(image, content_bytes=None):
-    """
-    0 / 90 / 180 / 270 sab test karke
-    best upright orientation choose karta hai.
-
-    NOTE: DSLR cameras (jaise ye wedding shoot) mein zyadatar
-    gyroscope/orientation sensor nahi hota, isliye EXIF Orientation
-    tag hamesha ek fixed default value likhta hai — chahe photo
-    kisi bhi angle pe khinchi gayi ho. Isliye EXIF ko face-detection
-    ke against "conflict override" ke liye use NAHI karte.
-    EXIF sirf tab use hota hai jab face bilkul na mile (last resort).
-    """
-
     image = resize_for_orientation_detection(image, max_size=1600)
 
-    candidates = []
-    for angle in ORIENTATION_ANGLES:
-        result = score_orientation_angle(image, angle)
-        candidates.append(result)
+    candidates = [score_orientation_angle(image, a) for a in ORIENTATION_ANGLES]
 
-    zero_candidate = next(c for c in candidates if c["angle"] == 0)
+    p_clip = _zero_shot_probs(image)
+    face = {c["angle"]: c["score"] for c in candidates}
+    any_face = any(c["faces"] > 0 for c in candidates)
 
-    candidates.sort(key=lambda x: x["weighted_total"], reverse=True)
+    combined = {}
+    for a in _ANGLES:
+        # face score sirf axis filter (0/180 vs 90/270) ka kaam karta hai
+        face_prior = (0.15 + face.get(a, 0.0)) ** 2 if any_face else 1.0
+        combined[a] = p_clip[a] * face_prior * ORIENTATION_PRIOR[a]
 
-    best = candidates[0]
-    second = candidates[1] if len(candidates) > 1 else None
+    total = sum(combined.values()) or 1.0
+    probs = {a: v / total for a, v in combined.items()}
+    best = max(probs, key=probs.get)
+    conf = probs[best]
 
-    best_score = best["score"]
-    second_score = second["score"] if second else 0
-    margin = best_score - second_score
-
-    if best["angle"] != 0 and zero_candidate["faces"] > 0:
-        weighted_gap = best["weighted_total"] - zero_candidate["weighted_total"]
-
-        if weighted_gap < ORIENTATION_ZERO_BIAS_WEIGHTED_MARGIN:
-            print(
-                f"⚠️ Best={best['angle']}° (weighted={best['weighted_total']:.4f}) "
-                f"but 0° weighted is close (weighted={zero_candidate['weighted_total']:.4f}) "
-                f"-> keeping 0°, not rotating"
-            )
-            best = zero_candidate
-            best_score = zero_candidate["score"]
-            remaining = [c for c in candidates if c["angle"] != 0]
-            second = remaining[0] if remaining else None
-            second_score = second["score"] if second else 0
-            margin = best_score - second_score
-        else:
-            print(
-                f"✅ Best={best['angle']}° weighted_total ({best['weighted_total']:.4f}) "
-                f"clearly beats 0° ({zero_candidate['weighted_total']:.4f}) -> trusting {best['angle']}°"
-            )
-
-    has_exif = False
-    exif_rotation = 0
-    if content_bytes is not None:
-        has_exif, exif_rotation = get_exif_rotation(content_bytes)
+    if conf < ORIENTATION_MIN_CONFIDENCE_COMBINED:
+        rotation, reason = 0, "low_confidence_keep_0"
+    else:
+        rotation, reason = best, "clip_zero_shot_plus_face_axis"
 
     print("\n==============================")
     print("ORIENTATION RESULT")
     print("==============================")
-    print("Candidates:", candidates)
-    print("Best Angle (face-based):", best["angle"])
-    print("Best Score:", round(best_score, 4))
-    print("Second Score:", round(second_score, 4))
-    print("Margin:", round(margin, 4))
-    print("Has EXIF tag:", has_exif, "| EXIF Rotation:", exif_rotation)
+    print("CLIP probs    :", {k: round(v, 3) for k, v in p_clip.items()})
+    print("Face scores   :", {k: round(v, 3) for k, v in face.items()})
+    print("Combined probs:", {k: round(v, 3) for k, v in probs.items()})
+    print(f"FINAL rotation: {rotation}° | conf={conf:.3f} | {reason}")
 
-    if best["faces"] == 0:
-        if has_exif and exif_rotation != 0:
-            print(f"📐 No face, EXIF says {exif_rotation}° -> using EXIF (last resort)")
-            return {
-                "rotation": exif_rotation,
-                "confidence": 0,
-                "faces": 0,
-                "autoRotated": True,
-                "reason": "no_face_exif_fallback",
-                "candidates": candidates
-            }
-
-        print("⚠️ No face detected & no EXIF hint -> rotation 0")
-        return {
-            "rotation": 0,
-            "confidence": 0,
-            "faces": 0,
-            "autoRotated": False,
-            "reason": "no_face_detected",
-            "candidates": candidates
-        }
-
-    if best_score < ORIENTATION_MIN_CONFIDENCE:
-        print("⚠️ Low confidence -> rotation 0")
-        return {
-            "rotation": 0,
-            "confidence": round(best_score, 4),
-            "faces": best["faces"],
-            "autoRotated": False,
-            "reason": "low_confidence",
-            "candidates": candidates
-        }
-
-    if margin < ORIENTATION_MIN_MARGIN:
-        print("⚠️ Ambiguous orientation")
-        print(f"⚠️ But using best candidate: {best['angle']}°")
-        return {
-            "rotation": best["angle"],
-            "confidence": round(best_score, 4),
-            "faces": best["faces"],
-            "autoRotated": best["angle"] != 0,
-            "reason": "ambiguous_best_candidate_used",
-            "candidates": candidates
-        }
-
-    print(f"✅ Orientation detected: {best['angle']}°")
+    best_faces = next((c["faces"] for c in candidates if c["angle"] == rotation), 0)
     return {
-        "rotation": best["angle"],
-        "confidence": round(best_score, 4),
-        "faces": best["faces"],
-        "autoRotated": best["angle"] != 0,
-        "reason": "orientation_detected",
-        "candidates": candidates
+        "rotation": rotation,
+        "confidence": round(conf, 4),
+        "faces": best_faces,
+        "autoRotated": rotation != 0,
+        "reason": reason,
+        "candidates": candidates,
+        "clipProbs": {str(k): round(v, 4) for k, v in p_clip.items()},
     }
-
-
-def get_exif_rotation(content_bytes):
-    """
-    Returns (has_tag: bool, rotation: int)
-    EXIF Orientation tag missing hone par has_tag=False —
-    taaki "tag missing" ko "genuine 0" na samjha jaye.
-    """
-    try:
-        img = Image.open(io.BytesIO(content_bytes))
-        exif = img.getexif()
-        orientation_tag = exif.get(274)  
-
-        if orientation_tag is None:
-            return False, 0
-
-        rotation = EXIF_ORIENTATION_TO_ROTATION.get(orientation_tag, 0)
-        return True, rotation
-
-    except Exception as e:
-        print(f"⚠️ EXIF read error: {e}")
-        return False, 0
 
 @app.post("/detect-orientation")
 async def detect_orientation_api(file: UploadFile = File(...)):
