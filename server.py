@@ -41,6 +41,8 @@ from mongoengine.queryset.visitor import Q
 import torch
 import open_clip
 from datetime import datetime, timedelta
+import mediapipe as mp
+import threading
 
 
 s3_client = boto3.client('s3') 
@@ -66,8 +68,15 @@ app = FastAPI(title="Face Recognition Server", version="1.0.0")
 ORIENTATION_ANGLES = [0, 90, 180, 270]
 
 ORIENTATION_MIN_FACE_SCORE = 0.50
-ORIENTATION_MIN_CONFIDENCE = 0.65
-ORIENTATION_MIN_MARGIN = 0.08
+
+# InsightFace confidence rules
+ORIENTATION_HIGH_CONFIDENCE = 0.90
+ORIENTATION_MIN_CONFIDENCE = 0.82
+ORIENTATION_MIN_MARGIN = 0.12
+
+# MediaPipe confidence rules
+MEDIAPIPE_MIN_CONFIDENCE = 0.82
+MEDIAPIPE_MIN_MARGIN = 0.10
 
 EXIF_ORIENTATION_TO_ROTATION = {
     1: 0,
@@ -75,6 +84,9 @@ EXIF_ORIENTATION_TO_ROTATION = {
     6: 90,
     8: 270,
 }
+
+_face_landmarker = None
+_face_landmarker_lock = threading.Lock()
 
 
 def resize_for_orientation_detection(image, max_size=1600):
@@ -116,13 +128,6 @@ def rotate_for_orientation(image, angle):
         return cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
     return image
-
-ORIENTATION_ANGLES = [0, 90, 180, 270]
-
-ORIENTATION_MIN_FACE_SCORE = 0.50
-ORIENTATION_MIN_CONFIDENCE = 0.65
-ORIENTATION_MIN_MARGIN = 0.08
-ORIENTATION_ZERO_BIAS_MARGIN = 0.03
 
 
 def calculate_face_upright_score(face):
@@ -232,79 +237,421 @@ def score_orientation_angle(image, angle):
         "weighted_total": weighted_total
     }
 
-ORIENTATION_ZERO_BIAS_WEIGHTED_MARGIN = 0.10
 
 
-def detect_image_orientation(image, content_bytes=None):
+def get_face_landmarker():
     """
-    0 / 90 / 180 / 270 sab test karke
-    best upright orientation choose karta hai.
+    MediaPipe model lazy initialize hoga aur memory mein ek hi baar rahega.
+    """
+    global _face_landmarker
 
-    NOTE: DSLR cameras (jaise ye wedding shoot) mein zyadatar
-    gyroscope/orientation sensor nahi hota, isliye EXIF Orientation
-    tag hamesha ek fixed default value likhta hai — chahe photo
-    kisi bhi angle pe khinchi gayi ho. Isliye EXIF ko face-detection
-    ke against "conflict override" ke liye use NAHI karte.
-    EXIF sirf tab use hota hai jab face bilkul na mile (last resort).
+    if _face_landmarker is None:
+        with _face_landmarker_lock:
+            if _face_landmarker is None:
+                model_path = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "face_landmarker.task"
+                )
+
+                if not os.path.exists(model_path):
+                    raise FileNotFoundError(
+                        f"MediaPipe model not found: {model_path}"
+                    )
+
+                BaseOptions = mp.tasks.BaseOptions
+                FaceLandmarker = mp.tasks.vision.FaceLandmarker
+                FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
+                RunningMode = mp.tasks.vision.RunningMode
+
+                options = FaceLandmarkerOptions(
+                    base_options=BaseOptions(model_asset_path=model_path),
+                    running_mode=RunningMode.IMAGE,
+                    num_faces=10,
+                    min_face_detection_confidence=0.5,
+                    min_face_presence_confidence=0.5,
+                    min_tracking_confidence=0.5
+                )
+
+                _face_landmarker = FaceLandmarker.create_from_options(
+                    options
+                )
+
+                print("✅ MediaPipe Face Landmarker initialized")
+
+    return _face_landmarker
+
+
+def calculate_mediapipe_upright_score(landmarks):
+    """
+    MediaPipe facial landmarks se upright score calculate karta hai.
+    Score 0 se 1 ke beech hota hai.
     """
 
-    image = resize_for_orientation_detection(image, max_size=1600)
+    try:
+        # MediaPipe Face Landmarker landmark indices
+        left_eye = landmarks[33]
+        right_eye = landmarks[263]
+        nose = landmarks[1]
+        left_mouth = landmarks[61]
+        right_mouth = landmarks[291]
 
-    candidates = []
-    for angle in ORIENTATION_ANGLES:
-        result = score_orientation_angle(image, angle)
-        candidates.append(result)
+        eye_distance = np.sqrt(
+            (right_eye.x - left_eye.x) ** 2 +
+            (right_eye.y - left_eye.y) ** 2
+        )
 
-    zero_candidate = next(c for c in candidates if c["angle"] == 0)
+        if eye_distance < 0.001:
+            return 0.0
 
-    candidates.sort(key=lambda x: x["weighted_total"], reverse=True)
+        eye_center_y = (left_eye.y + right_eye.y) / 2
+        mouth_center_y = (left_mouth.y + right_mouth.y) / 2
 
-    best = candidates[0]
-    second = candidates[1] if len(candidates) > 1 else None
+        eye_alignment = 1.0 - min(
+            abs(left_eye.y - right_eye.y) / eye_distance,
+            1.0
+        )
 
-    best_score = best["score"]
-    second_score = second["score"] if second else 0
-    margin = best_score - second_score
+        nose_score = float(np.clip(
+            (nose.y - eye_center_y) / (eye_distance * 0.30),
+            0.0,
+            1.0
+        ))
 
-    if best["angle"] != 0 and zero_candidate["faces"] > 0:
-        weighted_gap = best["weighted_total"] - zero_candidate["weighted_total"]
+        mouth_score = float(np.clip(
+            (mouth_center_y - nose.y) / (eye_distance * 0.30),
+            0.0,
+            1.0
+        ))
 
-        if weighted_gap < ORIENTATION_ZERO_BIAS_WEIGHTED_MARGIN:
-            print(
-                f"⚠️ Best={best['angle']}° (weighted={best['weighted_total']:.4f}) "
-                f"but 0° weighted is close (weighted={zero_candidate['weighted_total']:.4f}) "
-                f"-> keeping 0°, not rotating"
-            )
-            best = zero_candidate
-            best_score = zero_candidate["score"]
-            remaining = [c for c in candidates if c["angle"] != 0]
-            second = remaining[0] if remaining else None
-            second_score = second["score"] if second else 0
-            margin = best_score - second_score
-        else:
-            print(
-                f"✅ Best={best['angle']}° weighted_total ({best['weighted_total']:.4f}) "
-                f"clearly beats 0° ({zero_candidate['weighted_total']:.4f}) -> trusting {best['angle']}°"
-            )
+        nose_center_score = (
+            1.0
+            if min(left_eye.x, right_eye.x) <= nose.x <= max(left_eye.x, right_eye.x)
+            else 0.0
+        )
 
-    has_exif = False
-    exif_rotation = 0
+        score = (
+            eye_alignment * 0.20 +
+            nose_score * 0.35 +
+            mouth_score * 0.35 +
+            nose_center_score * 0.10
+        )
+
+        return float(score)
+
+    except Exception as e:
+        print(f"⚠️ MediaPipe orientation score error: {e}")
+        return 0.0
+
+
+def score_mediapipe_orientation_angle(image, angle):
+    """
+    MediaPipe se ek orientation angle test karta hai.
+    """
+
+    rotated = rotate_for_orientation(image, angle)
+
+    rgb_image = cv2.cvtColor(rotated, cv2.COLOR_BGR2RGB)
+
+    mp_image = mp.Image(
+        image_format=mp.ImageFormat.SRGB,
+        data=rgb_image
+    )
+
+    landmarker = get_face_landmarker()
+
+    with _face_landmarker_lock:
+        result = landmarker.detect(mp_image)
+
+    if not result.face_landmarks:
+        return {
+            "angle": angle,
+            "score": 0.0,
+            "faces": 0,
+            "weighted_total": 0.0
+        }
+
+    scores = [
+        calculate_mediapipe_upright_score(face_landmarks)
+        for face_landmarks in result.face_landmarks
+    ]
+
+    valid_scores = [s for s in scores if s > 0]
+
+    if not valid_scores:
+        return {
+            "angle": angle,
+            "score": 0.0,
+            "faces": 0,
+            "weighted_total": 0.0
+        }
+
+    average_score = float(np.mean(valid_scores))
+
+    return {
+        "angle": angle,
+        "score": average_score,
+        "faces": len(valid_scores),
+        "weighted_total": average_score * len(valid_scores)
+    }
+
+
+
+def detect_image_orientation(original_image, content_bytes=None):
+
+    # STEP 1: EXIF check first
     if content_bytes is not None:
         has_exif, exif_rotation = get_exif_rotation(content_bytes)
 
-    print("\n==============================")
-    print("ORIENTATION RESULT")
-    print("==============================")
-    print("Candidates:", candidates)
-    print("Best Angle (face-based):", best["angle"])
-    print("Best Score:", round(best_score, 4))
-    print("Second Score:", round(second_score, 4))
-    print("Margin:", round(margin, 4))
-    print("Has EXIF tag:", has_exif, "| EXIF Rotation:", exif_rotation)
+        if has_exif:
+            print(f"📐 EXIF orientation found: {exif_rotation}°")
 
-    if best["faces"] == 0:
+            return {
+                "rotation": exif_rotation,
+                "confidence": 1.0,
+                "faces": 0,
+                "autoRotated": exif_rotation != 0,
+                "reason": "exif_orientation",
+                "candidates": []
+            }
+
+    # STEP 2: EXIF unavailable, use AI
+    resized_image = resize_for_orientation_detection(
+        original_image,
+        max_size=1600
+    )
+
+    try:
+        return _detect_image_orientation_resized(resized_image)
+
+    finally:
+        del resized_image
+
+
+
+def _detect_image_orientation_resized(image, content_bytes=None):
+
+    candidates = []
+    mediapipe_candidates = []
+    valid_candidates = []
+    valid_mp_candidates = []
+
+    print("\n🔍 INSIGHTFACE ORIENTATION CHECK")
+
+    # =========================================
+    # STAGE 1: FIRST CHECK ONLY 0 DEGREE
+    # =========================================
+
+    result = score_orientation_angle(image, 0)
+    candidates.append(result)
+
+    print(
+        f"InsightFace | Angle=0° | "
+        f"Score={result['score']:.4f} | "
+        f"Faces={result['faces']}"
+    )
+
+    # Normal image: no need to check other angles
+    if (
+        result["faces"] > 0
+        and result["score"] >= ORIENTATION_MIN_CONFIDENCE
+    ):
+
+        print("✅ Normal orientation detected. Skipping remaining angles.")
+
+        return {
+            "rotation": 0,
+            "confidence": round(result["score"], 4),
+            "faces": result["faces"],
+            "autoRotated": False,
+            "reason": "orientation_detected",
+            "candidates": candidates
+        }
+
+    # =========================================
+    # STAGE 2: CHECK REMAINING ANGLES ONLY
+    # IF 0 DEGREE IS UNCERTAIN
+    # =========================================
+
+    print("⚠️ 0° uncertain. Checking remaining angles...")
+
+    for angle in [90, 180, 270]:
+
+        result = score_orientation_angle(image, angle)
+        candidates.append(result)
+
+        print(
+            f"InsightFace | Angle={angle}° | "
+            f"Score={result['score']:.4f} | "
+            f"Faces={result['faces']}"
+        )
+
+        # High confidence: return immediately
+        if (
+            result["faces"] > 0
+            and result["score"] >= ORIENTATION_HIGH_CONFIDENCE
+        ):
+
+            print(f"✅ HIGH CONFIDENCE: {angle}°")
+
+            return {
+                "rotation": angle,
+                "confidence": round(result["score"], 4),
+                "faces": result["faces"],
+                "autoRotated": angle != 0,
+                "reason": "orientation_detected",
+                "candidates": candidates
+            }
+
+    # =========================================
+    # STAGE 3: CHECK INSIGHTFACE RESULTS
+    # =========================================
+
+    valid_candidates = [
+        c for c in candidates if c["faces"] > 0
+    ]
+
+    valid_candidates.sort(
+        key=lambda x: x["score"],
+        reverse=True
+    )
+
+    if valid_candidates:
+
+        best = valid_candidates[0]
+
+        second_score = (
+            valid_candidates[1]["score"]
+            if len(valid_candidates) > 1
+            else 0.0
+        )
+
+        margin = best["score"] - second_score
+
+        if (
+            best["score"] >= ORIENTATION_MIN_CONFIDENCE
+            and margin >= ORIENTATION_MIN_MARGIN
+        ):
+
+            print(
+                f"✅ InsightFace CONFIDENT: {best['angle']}°"
+            )
+
+            return {
+                "rotation": best["angle"],
+                "confidence": round(best["score"], 4),
+                "faces": best["faces"],
+                "autoRotated": best["angle"] != 0,
+                "reason": "orientation_detected",
+                "candidates": candidates
+            }
+
+    # =========================================
+    # STAGE 4: MEDIAPIPE FALLBACK
+    # =========================================
+
+    print(
+        "⚠️ InsightFace uncertain. "
+        "Starting MediaPipe fallback..."
+    )
+
+    try:
+
+        for angle in ORIENTATION_ANGLES:
+
+            result = score_mediapipe_orientation_angle(
+                image,
+                angle
+            )
+
+            mediapipe_candidates.append(result)
+
+            print(
+                f"MediaPipe | Angle={angle}° | "
+                f"Score={result['score']:.4f} | "
+                f"Faces={result['faces']}"
+            )
+
+        valid_mp_candidates = [
+            c for c in mediapipe_candidates
+            if c["faces"] > 0
+        ]
+
+        valid_mp_candidates.sort(
+            key=lambda x: x["score"],
+            reverse=True
+        )
+
+        if valid_mp_candidates:
+
+            best_mp = valid_mp_candidates[0]
+
+            second_mp_score = (
+                valid_mp_candidates[1]["score"]
+                if len(valid_mp_candidates) > 1
+                else 0.0
+            )
+
+            mp_margin = best_mp["score"] - second_mp_score
+
+            if (
+                best_mp["score"] >= MEDIAPIPE_MIN_CONFIDENCE
+                and mp_margin >= MEDIAPIPE_MIN_MARGIN
+            ):
+
+                print(
+                    f"✅ MediaPipe CONFIDENT: {best_mp['angle']}°"
+                )
+
+                return {
+                    "rotation": best_mp["angle"],
+                    "confidence": round(best_mp["score"], 4),
+                    "faces": best_mp["faces"],
+                    "autoRotated": best_mp["angle"] != 0,
+                    "reason": "orientation_detected",
+                    "candidates": candidates
+                }
+
+    except Exception as e:
+
+        print(f"⚠️ MediaPipe fallback failed: {e}")
+
+    # =========================================
+    # STAGE 5: EXIF FALLBACK IF NO FACE
+    # =========================================
+
+    has_exif = False
+    exif_rotation = 0
+
+    if content_bytes is not None:
+
+        has_exif, exif_rotation = get_exif_rotation(
+            content_bytes
+        )
+
+    insight_faces = max(
+        (c["faces"] for c in candidates),
+        default=0
+    )
+
+    mp_faces = max(
+        (c["faces"] for c in mediapipe_candidates),
+        default=0
+    )
+
+    total_detected_faces = max(
+        insight_faces,
+        mp_faces
+    )
+
+    if total_detected_faces == 0:
+
         if has_exif and exif_rotation != 0:
-            print(f"📐 No face, EXIF says {exif_rotation}° -> using EXIF (last resort)")
+
+            print(
+                f"📐 No face detected. "
+                f"Using EXIF: {exif_rotation}°"
+            )
+
             return {
                 "rotation": exif_rotation,
                 "confidence": 0,
@@ -314,7 +661,6 @@ def detect_image_orientation(image, content_bytes=None):
                 "candidates": candidates
             }
 
-        print("⚠️ No face detected & no EXIF hint -> rotation 0")
         return {
             "rotation": 0,
             "confidence": 0,
@@ -324,60 +670,73 @@ def detect_image_orientation(image, content_bytes=None):
             "candidates": candidates
         }
 
-    if best_score < ORIENTATION_MIN_CONFIDENCE:
-        print("⚠️ Low confidence -> rotation 0")
-        return {
-            "rotation": 0,
-            "confidence": round(best_score, 4),
-            "faces": best["faces"],
-            "autoRotated": False,
-            "reason": "low_confidence",
-            "candidates": candidates
-        }
+    # =========================================
+    # STAGE 6: STILL UNCERTAIN
+    # =========================================
 
-    if margin < ORIENTATION_MIN_MARGIN:
-        print("⚠️ Ambiguous orientation")
-        print(f"⚠️ But using best candidate: {best['angle']}°")
-        return {
-            "rotation": best["angle"],
-            "confidence": round(best_score, 4),
-            "faces": best["faces"],
-            "autoRotated": best["angle"] != 0,
-            "reason": "ambiguous_best_candidate_used",
-            "candidates": candidates
-        }
+    print("⚠️ Both models uncertain. Returning uncertain result.")
 
-    print(f"✅ Orientation detected: {best['angle']}°")
+    best_confidence = 0.0
+
+    if valid_candidates:
+        best_confidence = valid_candidates[0]["score"]
+
+    if valid_mp_candidates:
+        best_confidence = max(
+            best_confidence,
+            valid_mp_candidates[0]["score"]
+        )
+
     return {
-        "rotation": best["angle"],
-        "confidence": round(best_score, 4),
-        "faces": best["faces"],
-        "autoRotated": best["angle"] != 0,
-        "reason": "orientation_detected",
+        "rotation": 0,
+        "confidence": round(best_confidence, 4),
+        "faces": total_detected_faces,
+        "autoRotated": False,
+        "reason": "uncertain",
         "candidates": candidates
     }
 
 
+
+
+
 def get_exif_rotation(content_bytes):
+
     """
     Returns (has_tag: bool, rotation: int)
-    EXIF Orientation tag missing hone par has_tag=False —
-    taaki "tag missing" ko "genuine 0" na samjha jaye.
     """
+
     try:
+
         img = Image.open(io.BytesIO(content_bytes))
         exif = img.getexif()
-        orientation_tag = exif.get(274)  
+
+        orientation_tag = exif.get(274)
 
         if orientation_tag is None:
             return False, 0
 
-        rotation = EXIF_ORIENTATION_TO_ROTATION.get(orientation_tag, 0)
+        # Only supported orientation values
+        if orientation_tag not in EXIF_ORIENTATION_TO_ROTATION:
+            return False, 0
+
+        rotation = EXIF_ORIENTATION_TO_ROTATION[orientation_tag]
+
         return True, rotation
 
     except Exception as e:
+
         print(f"⚠️ EXIF read error: {e}")
+
         return False, 0
+
+    finally:
+
+        if "img" in locals():
+            img.close()
+
+
+
 
 @app.post("/detect-orientation")
 async def detect_orientation_api(file: UploadFile = File(...)):
@@ -427,6 +786,45 @@ async def detect_orientation_api(file: UploadFile = File(...)):
             "reason": "python_error",
             "error": str(error)
         }
+
+
+
+
+def encode_crop_for_memory(crop, quality=85):
+    """
+    NumPy image ko compressed JPEG bytes mein convert karta hai.
+    """
+    if crop is None:
+        return None
+
+    success, encoded = cv2.imencode(
+        ".jpg",
+        crop,
+        [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+    )
+
+    if not success:
+        return None
+
+    return encoded.tobytes()
+
+
+def decode_crop_from_memory(crop_bytes):
+    """
+    Compressed JPEG bytes ko wapas NumPy image banata hai.
+    """
+    if not crop_bytes:
+        return None
+
+    image_array = np.frombuffer(
+        crop_bytes,
+        dtype=np.uint8
+    )
+
+    return cv2.imdecode(
+        image_array,
+        cv2.IMREAD_COLOR
+    )
 
 
 
@@ -1440,6 +1838,12 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
 
         for keys in batches:
             imgs = [read_s3_image(k) for k in keys]
+
+            batch_images = {
+                    key: img
+                    for key, img in zip(keys, imgs)
+                    if img is not None
+                }
             batch_candidates = []
             for img, key in zip(imgs, keys):
                 if img is None:
@@ -1464,7 +1868,9 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                     crop_y2 = min(h, y2 + pad_y)
                     face_crop = img[crop_y1:crop_y2, crop_x1:crop_x2]
                     if face_crop.size == 0:
-                        face_crop = img[y1:y2, x1:x2]
+                        crop_x1, crop_y1, crop_x2, crop_y2 = x1, y1, x2, y2
+                        face_crop = img[crop_y1:crop_y2, crop_x1:crop_x2]
+                    
 
                     disp_pad_x = int(face_w * DISPLAY_PAD_RATIO)
                     disp_pad_y = int(face_h * DISPLAY_PAD_RATIO)
@@ -1474,7 +1880,8 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                     disp_y2 = min(h, y2 + disp_pad_y)
                     display_crop = img[disp_y1:disp_y2, disp_x1:disp_x2]
                     if display_crop.size == 0:
-                        display_crop = face_crop
+                            disp_x1, disp_y1, disp_x2, disp_y2 = crop_x1, crop_y1, crop_x2, crop_y2
+                            display_crop = face_crop
 
                     if is_blurry_face(face_crop):
                         print(f"🚫 Blurry face rejected: {key}")
@@ -1485,8 +1892,16 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
 
                     batch_candidates.append({
                         "key": key,
-                        "face_crop": face_crop.copy(),
-                        "display_crop": display_crop.copy(),
+                        "crop_x1": crop_x1,
+                        "crop_y1": crop_y1,
+                        "crop_x2": crop_x2,
+                        "crop_y2": crop_y2,
+
+                        "disp_x1": disp_x1,
+                        "disp_y1": disp_y1,
+                        "disp_x2": disp_x2,
+                        "disp_y2": disp_y2,
+
                         "det_score": det_score,
                         "embedding": face.embedding,
                         "is_side": side_flag,
@@ -1497,11 +1912,20 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                 # ^ "for face in faces:" loop yaha khatam
             # ^ "for img, key in zip(imgs, keys):" loop bhi yaha khatam
             if not batch_candidates:
+                del imgs
+                del batch_images
+                del batch_candidates
                 continue
             # =====================================================
             # CLIP filter
             # =====================================================
-            crops = [c["face_crop"] for c in batch_candidates]
+            crops = [
+                    batch_images[c["key"]][
+                    c["crop_y1"]:c["crop_y2"],
+                    c["crop_x1"]:c["crop_x2"]
+                    ]
+                for c in batch_candidates
+            ]
             human_results = is_real_human_face_batch(crops)
 
             for candidate, (is_human, score) in zip(batch_candidates, human_results):
@@ -1512,40 +1936,102 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                 all_embeddings.append(candidate["embedding"])
                 face_metadata.append({
                     "key": candidate["key"],
-                    "face_crop": candidate["face_crop"],
-                    "display_crop": candidate["display_crop"],
+                    # Store compressed crops instead of full NumPy arrays
+"crop_x1": candidate["crop_x1"],
+"crop_y1": candidate["crop_y1"],
+"crop_x2": candidate["crop_x2"],
+"crop_y2": candidate["crop_y2"],
+
+"disp_x1": candidate["disp_x1"],
+"disp_y1": candidate["disp_y1"],
+"disp_x2": candidate["disp_x2"],
+"disp_y2": candidate["disp_y2"],
+                    "embedding": candidate["embedding"],
                     "det_score": candidate["det_score"],
                     "is_side": candidate["is_side"],
                     "is_smile": candidate["is_smile"],
                     "face_w": candidate["face_w"],
                     "face_h": candidate["face_h"],
-                    "embedding": candidate["embedding"],
                 })
+
+            del crops
+            del human_results
+            del batch_candidates
+            del imgs
+            del batch_images
+            face_crop = None
+            display_crop = None
+        
         if not all_embeddings:
             print("⚠️ No faces detected in the given images.")
             Folder.objects(id=folderId).update_one(
                 set__clusteringStatus="DONE",
             )
             return
+
         # =========================================================
         # STAGE 2: DBSCAN CLUSTERING
         # =========================================================
-        np_embeddings = np.array(all_embeddings)
-        clustering = DBSCAN(eps=EPS, min_samples=MIN_SAMPLES, metric="cosine")
+        print(f"🧩 Total faces for DBSCAN: {len(all_embeddings)}")
+
+        # Embeddings ko float32 mein rakho, unnecessary memory usage kam hogi
+        np_embeddings = np.asarray(all_embeddings, dtype=np.float32)
+
+        print(
+        f"📊 DBSCAN input shape: {np_embeddings.shape} | "
+        f"Memory: {np_embeddings.nbytes / (1024 * 1024):.2f} MB"
+        )
+
+        clustering = DBSCAN(
+                eps=EPS,
+                min_samples=MIN_SAMPLES,
+                metric="cosine"
+        )
+
         labels = clustering.fit_predict(np_embeddings)
+
+        print(f"✅ DBSCAN completed: {len(set(labels) - {-1})} clusters")
+
+        # DBSCAN ka internal memory release karo
+        del clustering
+        del np_embeddings
+        del all_embeddings
+
+        cluster_groups = {}
+        noise_id_counter = -2
+
         cluster_groups = {}
         noise_id_counter = -2
 
         MIN_GOOD_FACE_SIZE = 90  
 
+        cached_image_key = None
+        cached_image = None
+
         for label, metadata in zip(labels, face_metadata):
+
+            if cached_image_key != metadata["key"]:
+                cached_image = read_s3_image(metadata["key"])
+                cached_image_key = metadata["key"]
+
+            if cached_image is None:
+               continue
+
+            face_crop = cached_image[
+            metadata["crop_y1"]:metadata["crop_y2"],
+            metadata["crop_x1"]:metadata["crop_x2"]
+            ]
+
+            if face_crop.size == 0:
+                   continue
+
             if label == -1:
                 current_group_id = noise_id_counter
                 noise_id_counter -= 1
             else:
                 current_group_id = label
 
-            crop_sharpness = compute_sharpness(metadata["face_crop"])
+            crop_sharpness = compute_sharpness(face_crop)
             face_size = min(metadata["face_w"], metadata["face_h"])
 
             if current_group_id not in cluster_groups:
@@ -1553,8 +2039,19 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
 
                 cluster_groups[current_group_id] = {
                     "images": [],
-                    "best_crop": metadata["face_crop"],
-                    "best_display_crop": metadata["display_crop"],
+                    "best_crop_key": metadata["key"],
+                    "best_crop_coords": (
+        metadata["crop_x1"],
+        metadata["crop_y1"],
+        metadata["crop_x2"],
+        metadata["crop_y2"]
+    ),
+                    "best_display_coords": (
+        metadata["disp_x1"],
+        metadata["disp_y1"],
+        metadata["disp_x2"],
+        metadata["disp_y2"]
+    ),
                     "max_score": metadata["det_score"],
                     "best_sharpness": crop_sharpness,
                     "best_is_side": metadata["is_side"],
@@ -1562,6 +2059,7 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                     "best_face_size": face_size,
                     "best_embedding": emb,
                     "all_frontal_embeddings": [] if metadata["is_side"] else [metadata["embedding"]],
+
                 }
 
             else:
@@ -1580,8 +2078,19 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
             old_priority = (old_good_size, 0 if group["best_is_side"] else 1, 1 if group["best_is_smile"] else 0)
 
             if new_priority > old_priority:
-                group["best_crop"] = metadata["face_crop"]
-                group["best_display_crop"] = metadata["display_crop"]
+                group["best_crop_key"] = metadata["key"]
+                group["best_crop_coords"] = (
+                    metadata["crop_x1"],
+                    metadata["crop_y1"],
+                    metadata["crop_x2"],
+                    metadata["crop_y2"]
+                )
+                group["best_display_coords"] = (
+                    metadata["disp_x1"],
+    metadata["disp_y1"],
+    metadata["disp_x2"],
+    metadata["disp_y2"]
+)
                 group["max_score"] = metadata["det_score"]
                 group["best_sharpness"] = crop_sharpness
                 group["best_is_side"] = metadata["is_side"]
@@ -1596,8 +2105,19 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                 is_sharper = crop_sharpness > current_best_sharp
 
                 if is_sharper and det_close_enough:
-                    group["best_crop"] = metadata["face_crop"]
-                    group["best_display_crop"] = metadata["display_crop"]
+                    group["best_crop_key"] = metadata["key"]
+                    group["best_crop_coords"] = (
+    metadata["crop_x1"],
+    metadata["crop_y1"],
+    metadata["crop_x2"],
+    metadata["crop_y2"]
+)
+                    group["best_display_coords"] = (
+    metadata["disp_x1"],
+    metadata["disp_y1"],
+    metadata["disp_x2"],
+    metadata["disp_y2"]
+)
                     group["best_sharpness"] = crop_sharpness
                     group["best_is_side"] = metadata["is_side"]
                     group["best_is_smile"] = metadata["is_smile"]
@@ -1605,14 +2125,29 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                     if metadata["det_score"] > current_best_det:
                         group["max_score"] = metadata["det_score"]
                 elif metadata["det_score"] > current_best_det + 0.05:
-                    group["best_crop"] = metadata["face_crop"]
-                    group["best_display_crop"] = metadata["display_crop"]
+                    group["best_crop_key"] = metadata["key"]
+                    group["best_crop_coords"] = (
+    metadata["crop_x1"],
+    metadata["crop_y1"],
+    metadata["crop_x2"],
+    metadata["crop_y2"]
+)
+                    group["best_display_coords"] = (
+    metadata["disp_x1"],
+    metadata["disp_y1"],
+    metadata["disp_x2"],
+    metadata["disp_y2"]
+)
                     group["max_score"] = metadata["det_score"]
                     group["best_sharpness"] = crop_sharpness
                     group["best_is_side"] = metadata["is_side"]
                     group["best_is_smile"] = metadata["is_smile"]
                     group["best_face_size"] = face_size
             # else: purana wala hi better hai, kuch mat karo
+
+
+        cached_image = None
+        face_crop = None
 
         print(f"🧩 DBSCAN se {len(cluster_groups)} cluster(s) bane is run me (EPS={EPS})")
 
@@ -1693,8 +2228,32 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
 
             # ===================== CREATE PATH (naya person) =====================
 
+
+            # Best image ko S3 se load karo (sirf unmatched person ke liye)
+            best_image = read_s3_image(group_data["best_crop_key"])
+
+            if best_image is None:
+              print(f"⚠️ Best image not found: {group_data['best_crop_key']}")
+              continue
+
+            # Face crop coordinates
+            x1, y1, x2, y2 = group_data["best_crop_coords"]
+
+            face_crop = best_image[y1:y2, x1:x2]
+
+            # Display crop coordinates
+            dx1, dy1, dx2, dy2 = group_data["best_display_coords"]
+
+            display_crop = best_image[dy1:dy2, dx1:dx2]
+
+            if face_crop.size == 0 or display_crop.size == 0:
+               print(f"⚠️ Invalid crop for group {group_id}")
+               continue
+
+
+
             try:
-                _gray_check = cv2.cvtColor(group_data["best_crop"], cv2.COLOR_RGB2GRAY)
+                _gray_check = cv2.cvtColor(face_crop, cv2.COLOR_RGB2GRAY)
                 _final_variance = cv2.Laplacian(_gray_check, cv2.CV_64F).var()
                 print(f"🖼️ FOLDER CROP VARIANCE = {_final_variance:.2f} (group_id={group_id})")
             except Exception as _e:
@@ -1702,10 +2261,14 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
 
             person_id = str(uuid.uuid4())
             crop_key, crop_url = upload_face_crop(
-                group_data["best_display_crop"],
+                display_crop,
                 folderId,
                 person_id
             )
+
+            best_image = None
+            face_crop = None
+            display_crop = None
             sub_id = str(bson.ObjectId())
 
             try:
@@ -1889,6 +2452,8 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
         Folder.objects(id=folderId).update_one(
             set__clusteringStatus="FAILED"
         )
+
+
  
 @app.post("/count-unique-persons")
 async def count_unique_persons(
