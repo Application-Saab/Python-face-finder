@@ -45,6 +45,57 @@ import mediapipe as mp
 import threading
 
 
+
+
+import psutil
+import threading
+
+memory_process = psutil.Process(os.getpid())
+
+LIBRARIES = [
+    "InsightFace",
+    "ONNX Runtime",
+    "MobileNetV3",
+    "MediaPipe",
+    "OpenCV",
+    "NumPy",
+    "Pillow",
+    "PyTorch",
+    "OpenCLIP",
+    "Scikit-learn",
+    "Boto3",
+    "FastAPI",
+    "Uvicorn",
+    "MongoEngine",
+    "Requests",
+]
+
+def log_all_library_memory():
+    print("\n========== LIBRARY MEMORY REPORT ==========")
+
+    try:
+        memory = memory_process.memory_full_info()
+        print(f"TOTAL SERVER RSS : {memory.rss / 1024**2:.2f} MB")
+        print(f"TOTAL SERVER USS : {memory.uss / 1024**2:.2f} MB")
+    except Exception:
+        memory = memory_process.memory_info()
+        print(f"TOTAL SERVER RSS : {memory.rss / 1024**2:.2f} MB")
+
+    for library in LIBRARIES:
+        print(f"{library}: Loaded (individual RAM not available)")
+
+    print("===========================================\n")
+
+
+def start_memory_monitor():
+    def monitor():
+        while True:
+            log_all_library_memory()
+            threading.Event().wait(5)
+
+    threading.Thread(target=monitor, daemon=True).start()
+
+
 s3_client = boto3.client('s3') 
 BUCKET_NAME = "photography-hora"
 AWS_REGION = os.getenv("AWS_REGION", "eu-north-1")
@@ -1077,6 +1128,8 @@ async def startup_event():
     # MongoDB connect
     connect_db()
     print("✅ MongoDB connected")
+    
+    start_memory_monitor()
 
 @app.get("/health")
 async def health_check():
@@ -1407,94 +1460,35 @@ MERGE_THRESHOLD = 0.50
 STALE_LOCK_MINUTES = 15
 BLUR_THRESHOLD = 300.0
  
- 
-# =====================================================================
-# NAYA ADDITION #1: CLIP model ek hi baar yaha load hota hai (file ke
-# top pe, function ke bahar) — taaki har baar dubara load na ho.
-# =====================================================================
-_CLIP_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
- 
-_clip_model, _, _clip_preprocess = open_clip.create_model_and_transforms(
-    "ViT-B-32", pretrained="openai"
+ # =========================================================
+# MOBILENETV3 ONNX MODEL INITIALIZATION
+# =========================================================
+
+import onnxruntime as ort
+
+MODEL_PATH = os.path.join(
+    os.path.dirname(__file__),
+    "models",
+    "mobilenetv3_anime_real.onnx"
 )
-_clip_model.eval().to(_CLIP_DEVICE)
-_clip_tokenizer = open_clip.get_tokenizer("ViT-B-32")
+
+session_options = ort.SessionOptions()
+session_options.intra_op_num_threads = 2
+session_options.inter_op_num_threads = 1
+session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+mobilenet_session = ort.InferenceSession(
+    MODEL_PATH,
+    sess_options=session_options,
+    providers=["CPUExecutionProvider"]
+)
+
+MOBILENET_INPUT = mobilenet_session.get_inputs()[0].name
+MOBILENET_OUTPUT = mobilenet_session.get_outputs()[0].name
+
+print("✅ MobileNetV3 loaded successfully")
  
-_REAL_PROMPTS = [
-    "a photo of a real human face",
-    "a close-up photograph of a person's face",
-    "a candid photo of a human face",
-    "a portrait photograph of a real person",
-    "a photo of a real human baby's face",
-]
-_FAKE_PROMPTS = [
-    "a doll's face",
-    "a plastic toy doll face with painted eyes",
-    "a realistic baby doll face, not a real baby",
-    "a cartoon or anime character face",
-    "a statue or sculpture face",
-    "a mannequin face",
-    "an illustration or painting of a face",
-    "a costume or animal mask face",
-    "a toy or action figure face",
-]
- 
-with torch.no_grad():
-    _real_tok = _clip_tokenizer(_REAL_PROMPTS).to(_CLIP_DEVICE)
-    _fake_tok = _clip_tokenizer(_FAKE_PROMPTS).to(_CLIP_DEVICE)
- 
-    _real_emb = _clip_model.encode_text(_real_tok)
-    _fake_emb = _clip_model.encode_text(_fake_tok)
- 
-    _real_emb = _real_emb / _real_emb.norm(dim=-1, keepdim=True)
-    _fake_emb = _fake_emb / _fake_emb.norm(dim=-1, keepdim=True)
- 
-    _REAL_ANCHOR = _real_emb.mean(dim=0, keepdim=True)
-    _FAKE_ANCHOR = _fake_emb.mean(dim=0, keepdim=True)
-    _REAL_ANCHOR = _REAL_ANCHOR / _REAL_ANCHOR.norm(dim=-1, keepdim=True)
-    _FAKE_ANCHOR = _FAKE_ANCHOR / _FAKE_ANCHOR.norm(dim=-1, keepdim=True)
- 
-REAL_FACE_THRESHOLD = 0.68  # apne data pe test karke adjust karein
- 
- 
-# =====================================================================
-# NAYA ADDITION #2: batched filter function — ek image-batch ke saare
-# faces ek saath check karta hai, isliye slow nahi hota.
-# =====================================================================
-def is_real_human_face_batch(face_crops, threshold=REAL_FACE_THRESHOLD, batch_size=64):
-    """
-    face_crops: list of RGB numpy arrays (aapke face crops).
-    Return: list of (is_real: bool, score: float), face_crops ke order mein.
-    """
-    results = [None] * len(face_crops)
-    valid_idx = [i for i, c in enumerate(face_crops) if c is not None and c.size > 0]
- 
-    for start in range(0, len(valid_idx), batch_size):
-        chunk_idx = valid_idx[start:start + batch_size]
-        tensors = torch.stack(
-            [_clip_preprocess(Image.fromarray(face_crops[i])) for i in chunk_idx]
-        ).to(_CLIP_DEVICE)
- 
-        with torch.no_grad():
-            img_emb = _clip_model.encode_image(tensors)
-            img_emb = img_emb / img_emb.norm(dim=-1, keepdim=True)
- 
-            real_sim = (img_emb @ _REAL_ANCHOR.T).squeeze(-1)
-            fake_sim = (img_emb @ _FAKE_ANCHOR.T).squeeze(-1)
- 
-            stacked = torch.stack([real_sim, fake_sim], dim=1) * 100
-            probs = torch.softmax(stacked, dim=1)[:, 0]
- 
-        for local_i, global_i in enumerate(chunk_idx):
-            score = float(probs[local_i])
-            results[global_i] = (score >= threshold, score)
- 
-    for i in range(len(face_crops)):
-        if results[i] is None:
-            results[i] = (False, 0.0)
- 
-    return results
- 
+
 def upload_face_crop(face_crop, folder_id, person_id):
     h, w = face_crop.shape[:2]
     MIN_DP_SIZE = 250
@@ -1572,6 +1566,84 @@ def is_side_face(face_obj):
         print(f"⚠️ is_side_face check failed: {e}")
         return False
 
+def is_real_human_face_batch(face_crops, threshold=0.70, batch_size=32):
+    results = []
+
+    for start in range(0, len(face_crops), batch_size):
+        batch = face_crops[start:start + batch_size]
+        processed = []
+
+        for crop in batch:
+            try:
+                if crop is None or crop.size == 0:
+                    processed.append(None)
+                    continue
+
+                image = Image.fromarray(crop.astype(np.uint8)).convert("RGB")
+
+                image = image.resize(
+                    (384, 384),
+                    Image.Resampling.BILINEAR
+                )
+
+                data = np.asarray(image, dtype=np.float32) / 255.0
+
+                data = np.transpose(data, (2, 0, 1))
+                data = (data - 0.5) / 0.5
+
+                processed.append(data.astype(np.float32))
+
+            except Exception as e:
+                print(f"⚠️ MobileNet preprocessing failed: {e}")
+                processed.append(None)
+
+        valid_indices = [
+            i for i, item in enumerate(processed)
+            if item is not None
+        ]
+
+        if not valid_indices:
+            results.extend([(False, 0.0)] * len(batch))
+            continue
+
+        input_batch = np.stack(
+            [processed[i] for i in valid_indices]
+        ).astype(np.float32)
+
+        try:
+            outputs = mobilenet_session.run(
+                [MOBILENET_OUTPUT],
+                {MOBILENET_INPUT: input_batch}
+            )[0]
+
+            for i, output in enumerate(outputs):
+                # Model labels: anime = 0, real = 1
+                real_score = float(output[1])
+
+                # Output is class scores; convert to probability.
+                scores = np.exp(output - np.max(output))
+                probabilities = scores / np.sum(scores)
+
+                real_probability = float(probabilities[1])
+
+                processed[valid_indices[i]] = (
+                    real_probability >= threshold,
+                    real_probability
+                )
+
+        except Exception as e:
+            print(f"❌ MobileNet inference failed: {e}")
+
+            for idx in valid_indices:
+                processed[idx] = (False, 0.0)
+
+        for item in processed:
+            if item is None:
+                results.append((False, 0.0))
+            else:
+                results.append(item)
+
+    return results
 
 _SMILE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_smile.xml")
 
