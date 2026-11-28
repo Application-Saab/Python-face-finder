@@ -8,6 +8,7 @@ from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from insightface.app import FaceAnalysis
+import onnxruntime as ort
 from numpy.linalg import norm
 import numpy as np
 import os
@@ -32,15 +33,30 @@ from dotenv import load_dotenv
 load_dotenv()
 from fastapi import BackgroundTasks
 from fastapi import Form, HTTPException
-from eventFaceFinder import router as event_router
+# from eventFaceFinder import router as event_router
 import gc 
 from datetime import datetime
 import requests
 import bson
 from mongoengine.queryset.visitor import Q  
-import torch
-import open_clip
 from datetime import datetime, timedelta
+import mediapipe as mp
+import threading
+
+
+import psutil
+import os
+
+def print_memory(label):
+    process = psutil.Process(os.getpid())
+    mem = process.memory_full_info()
+
+    rss_mb = mem.rss / (1024 * 1024)
+    uss_mb = getattr(mem, "uss", 0) / (1024 * 1024)
+
+    print(f"\n========== {label} ==========")
+    print(f"RSS: {rss_mb:.2f} MB | USS: {uss_mb:.2f} MB")
+    print("============================\n")
 
 
 s3_client = boto3.client('s3') 
@@ -66,8 +82,15 @@ app = FastAPI(title="Face Recognition Server", version="1.0.0")
 ORIENTATION_ANGLES = [0, 90, 180, 270]
 
 ORIENTATION_MIN_FACE_SCORE = 0.50
-ORIENTATION_MIN_CONFIDENCE = 0.65
-ORIENTATION_MIN_MARGIN = 0.08
+
+# InsightFace confidence rules
+ORIENTATION_HIGH_CONFIDENCE = 0.90
+ORIENTATION_MIN_CONFIDENCE = 0.82
+ORIENTATION_MIN_MARGIN = 0.12
+
+# MediaPipe confidence rules
+MEDIAPIPE_MIN_CONFIDENCE = 0.82
+MEDIAPIPE_MIN_MARGIN = 0.10
 
 EXIF_ORIENTATION_TO_ROTATION = {
     1: 0,
@@ -76,27 +99,8 @@ EXIF_ORIENTATION_TO_ROTATION = {
     8: 270,
 }
 
-
-def resize_for_orientation_detection(image, max_size=1600):
-    """
-    AI ke liye image ko chhota karta hai.
-    Original image ko modify nahi karta.
-    """
-    height, width = image.shape[:2]
-    largest = max(width, height)
-
-    if largest <= max_size:
-        return image
-
-    scale = max_size / largest
-    new_width = int(width * scale)
-    new_height = int(height * scale)
-
-    return cv2.resize(
-        image,
-        (new_width, new_height),
-        interpolation=cv2.INTER_AREA
-    )
+_face_landmarker = None
+_face_landmarker_lock = threading.Lock()
 
 
 def rotate_for_orientation(image, angle):
@@ -116,13 +120,6 @@ def rotate_for_orientation(image, angle):
         return cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
     return image
-
-ORIENTATION_ANGLES = [0, 90, 180, 270]
-
-ORIENTATION_MIN_FACE_SCORE = 0.50
-ORIENTATION_MIN_CONFIDENCE = 0.65
-ORIENTATION_MIN_MARGIN = 0.08
-ORIENTATION_ZERO_BIAS_MARGIN = 0.03
 
 
 def calculate_face_upright_score(face):
@@ -232,79 +229,420 @@ def score_orientation_angle(image, angle):
         "weighted_total": weighted_total
     }
 
-ORIENTATION_ZERO_BIAS_WEIGHTED_MARGIN = 0.10
 
 
-def detect_image_orientation(image, content_bytes=None):
+def get_face_landmarker():
     """
-    0 / 90 / 180 / 270 sab test karke
-    best upright orientation choose karta hai.
+    MediaPipe model lazy initialize hoga aur memory mein ek hi baar rahega.
+    """
+    global _face_landmarker
 
-    NOTE: DSLR cameras (jaise ye wedding shoot) mein zyadatar
-    gyroscope/orientation sensor nahi hota, isliye EXIF Orientation
-    tag hamesha ek fixed default value likhta hai — chahe photo
-    kisi bhi angle pe khinchi gayi ho. Isliye EXIF ko face-detection
-    ke against "conflict override" ke liye use NAHI karte.
-    EXIF sirf tab use hota hai jab face bilkul na mile (last resort).
+    if _face_landmarker is None:
+        with _face_landmarker_lock:
+            if _face_landmarker is None:
+                model_path = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "face_landmarker.task"
+                )
+
+                if not os.path.exists(model_path):
+                    raise FileNotFoundError(
+                        f"MediaPipe model not found: {model_path}"
+                    )
+
+                BaseOptions = mp.tasks.BaseOptions
+                FaceLandmarker = mp.tasks.vision.FaceLandmarker
+                FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
+                RunningMode = mp.tasks.vision.RunningMode
+
+                options = FaceLandmarkerOptions(
+                    base_options=BaseOptions(model_asset_path=model_path),
+                    running_mode=RunningMode.IMAGE,
+                    num_faces=10,
+                    min_face_detection_confidence=0.5,
+                    min_face_presence_confidence=0.5,
+                    min_tracking_confidence=0.5
+                )
+
+                _face_landmarker = FaceLandmarker.create_from_options(
+                    options
+                )
+                print_memory("AFTER MEDIAPIPE MODEL LOAD")
+
+                print("✅ MediaPipe Face Landmarker initialized")
+
+    return _face_landmarker
+
+
+def calculate_mediapipe_upright_score(landmarks):
+    """
+    MediaPipe facial landmarks se upright score calculate karta hai.
+    Score 0 se 1 ke beech hota hai.
     """
 
-    image = resize_for_orientation_detection(image, max_size=1600)
+    try:
+        # MediaPipe Face Landmarker landmark indices
+        left_eye = landmarks[33]
+        right_eye = landmarks[263]
+        nose = landmarks[1]
+        left_mouth = landmarks[61]
+        right_mouth = landmarks[291]
 
-    candidates = []
-    for angle in ORIENTATION_ANGLES:
-        result = score_orientation_angle(image, angle)
-        candidates.append(result)
+        eye_distance = np.sqrt(
+            (right_eye.x - left_eye.x) ** 2 +
+            (right_eye.y - left_eye.y) ** 2
+        )
 
-    zero_candidate = next(c for c in candidates if c["angle"] == 0)
+        if eye_distance < 0.001:
+            return 0.0
 
-    candidates.sort(key=lambda x: x["weighted_total"], reverse=True)
+        eye_center_y = (left_eye.y + right_eye.y) / 2
+        mouth_center_y = (left_mouth.y + right_mouth.y) / 2
 
-    best = candidates[0]
-    second = candidates[1] if len(candidates) > 1 else None
+        eye_alignment = 1.0 - min(
+            abs(left_eye.y - right_eye.y) / eye_distance,
+            1.0
+        )
 
-    best_score = best["score"]
-    second_score = second["score"] if second else 0
-    margin = best_score - second_score
+        nose_score = float(np.clip(
+            (nose.y - eye_center_y) / (eye_distance * 0.30),
+            0.0,
+            1.0
+        ))
 
-    if best["angle"] != 0 and zero_candidate["faces"] > 0:
-        weighted_gap = best["weighted_total"] - zero_candidate["weighted_total"]
+        mouth_score = float(np.clip(
+            (mouth_center_y - nose.y) / (eye_distance * 0.30),
+            0.0,
+            1.0
+        ))
 
-        if weighted_gap < ORIENTATION_ZERO_BIAS_WEIGHTED_MARGIN:
-            print(
-                f"⚠️ Best={best['angle']}° (weighted={best['weighted_total']:.4f}) "
-                f"but 0° weighted is close (weighted={zero_candidate['weighted_total']:.4f}) "
-                f"-> keeping 0°, not rotating"
-            )
-            best = zero_candidate
-            best_score = zero_candidate["score"]
-            remaining = [c for c in candidates if c["angle"] != 0]
-            second = remaining[0] if remaining else None
-            second_score = second["score"] if second else 0
-            margin = best_score - second_score
-        else:
-            print(
-                f"✅ Best={best['angle']}° weighted_total ({best['weighted_total']:.4f}) "
-                f"clearly beats 0° ({zero_candidate['weighted_total']:.4f}) -> trusting {best['angle']}°"
-            )
+        nose_center_score = (
+            1.0
+            if min(left_eye.x, right_eye.x) <= nose.x <= max(left_eye.x, right_eye.x)
+            else 0.0
+        )
 
-    has_exif = False
-    exif_rotation = 0
+        score = (
+            eye_alignment * 0.20 +
+            nose_score * 0.35 +
+            mouth_score * 0.35 +
+            nose_center_score * 0.10
+        )
+
+        return float(score)
+
+    except Exception as e:
+        print(f"⚠️ MediaPipe orientation score error: {e}")
+        return 0.0
+
+
+def score_mediapipe_orientation_angle(image, angle):
+    """
+    MediaPipe se ek orientation angle test karta hai.
+    """
+
+    rotated = rotate_for_orientation(image, angle)
+
+    rgb_image = cv2.cvtColor(rotated, cv2.COLOR_BGR2RGB)
+
+    mp_image = mp.Image(
+        image_format=mp.ImageFormat.SRGB,
+        data=rgb_image
+    )
+
+    landmarker = get_face_landmarker()
+
+    with _face_landmarker_lock:
+        result = landmarker.detect(mp_image)
+    print_memory("AFTER MEDIAPIPE INFERENCE")
+
+    if not result.face_landmarks:
+        return {
+            "angle": angle,
+            "score": 0.0,
+            "faces": 0,
+            "weighted_total": 0.0
+        }
+
+    scores = [
+        calculate_mediapipe_upright_score(face_landmarks)
+        for face_landmarks in result.face_landmarks
+    ]
+
+    valid_scores = [s for s in scores if s > 0]
+
+    if not valid_scores:
+        return {
+            "angle": angle,
+            "score": 0.0,
+            "faces": 0,
+            "weighted_total": 0.0
+        }
+
+    average_score = float(np.mean(valid_scores))
+
+    return {
+        "angle": angle,
+        "score": average_score,
+        "faces": len(valid_scores),
+        "weighted_total": average_score * len(valid_scores)
+    }
+
+
+
+def detect_image_orientation(original_image, content_bytes=None):
+
+    # STEP 1: EXIF check first
     if content_bytes is not None:
         has_exif, exif_rotation = get_exif_rotation(content_bytes)
 
-    print("\n==============================")
-    print("ORIENTATION RESULT")
-    print("==============================")
-    print("Candidates:", candidates)
-    print("Best Angle (face-based):", best["angle"])
-    print("Best Score:", round(best_score, 4))
-    print("Second Score:", round(second_score, 4))
-    print("Margin:", round(margin, 4))
-    print("Has EXIF tag:", has_exif, "| EXIF Rotation:", exif_rotation)
+        if has_exif:
+            print(f"📐 EXIF orientation found: {exif_rotation}°")
 
-    if best["faces"] == 0:
+            return {
+                "rotation": exif_rotation,
+                "confidence": 1.0,
+                "faces": 0,
+                "autoRotated": exif_rotation != 0,
+                "reason": "exif_orientation",
+                "candidates": []
+            }
+
+    try:
+        return _detect_image_orientation(
+               original_image,
+               content_bytes=content_bytes
+        )
+
+    finally:
+        del original_image
+
+
+
+def _detect_image_orientation(image, content_bytes=None):
+
+    candidates = []
+    mediapipe_candidates = []
+    valid_candidates = []
+    valid_mp_candidates = []
+
+    print("\n🔍 INSIGHTFACE ORIENTATION CHECK")
+
+    # =========================================
+    # STAGE 1: FIRST CHECK ONLY 0 DEGREE
+    # =========================================
+
+    result = score_orientation_angle(image, 0)
+    candidates.append(result)
+
+    print(
+        f"InsightFace | Angle=0° | "
+        f"Score={result['score']:.4f} | "
+        f"Faces={result['faces']}"
+    )
+
+    # Normal image: no need to check other angles
+    if (
+        result["faces"] > 0
+        and result["score"] >= ORIENTATION_MIN_CONFIDENCE
+    ):
+
+        print("✅ Normal orientation detected. Skipping remaining angles.")
+
+        return {
+            "rotation": 0,
+            "confidence": round(result["score"], 4),
+            "faces": result["faces"],
+            "autoRotated": False,
+            "reason": "orientation_detected",
+            "candidates": candidates
+        }
+
+    # =========================================
+    # STAGE 2: CHECK REMAINING ANGLES ONLY
+    # IF 0 DEGREE IS UNCERTAIN
+    # =========================================
+
+    print("⚠️ 0° uncertain. Checking remaining angles...")
+
+    for angle in [90, 180, 270]:
+
+        result = score_orientation_angle(image, angle)
+        candidates.append(result)
+
+        print(
+            f"InsightFace | Angle={angle}° | "
+            f"Score={result['score']:.4f} | "
+            f"Faces={result['faces']}"
+        )
+
+        # High confidence: return immediately
+        if (
+            result["faces"] > 0
+            and result["score"] >= ORIENTATION_HIGH_CONFIDENCE
+        ):
+
+            print(f"✅ HIGH CONFIDENCE: {angle}°")
+
+            return {
+                "rotation": angle,
+                "confidence": round(result["score"], 4),
+                "faces": result["faces"],
+                "autoRotated": angle != 0,
+                "reason": "orientation_detected",
+                "candidates": candidates
+            }
+
+    # =========================================
+    # STAGE 3: CHECK INSIGHTFACE RESULTS
+    # =========================================
+
+    valid_candidates = [
+        c for c in candidates if c["faces"] > 0
+    ]
+
+    valid_candidates.sort(
+        key=lambda x: x["score"],
+        reverse=True
+    )
+
+    if valid_candidates:
+
+        best = valid_candidates[0]
+
+        second_score = (
+            valid_candidates[1]["score"]
+            if len(valid_candidates) > 1
+            else 0.0
+        )
+
+        margin = best["score"] - second_score
+
+        if (
+            best["score"] >= ORIENTATION_MIN_CONFIDENCE
+            and margin >= ORIENTATION_MIN_MARGIN
+        ):
+
+            print(
+                f"✅ InsightFace CONFIDENT: {best['angle']}°"
+            )
+
+            return {
+                "rotation": best["angle"],
+                "confidence": round(best["score"], 4),
+                "faces": best["faces"],
+                "autoRotated": best["angle"] != 0,
+                "reason": "orientation_detected",
+                "candidates": candidates
+            }
+
+    # =========================================
+    # STAGE 4: MEDIAPIPE FALLBACK
+    # =========================================
+
+    print(
+        "⚠️ InsightFace uncertain. "
+        "Starting MediaPipe fallback..."
+    )
+
+    try:
+
+        for angle in ORIENTATION_ANGLES:
+
+            result = score_mediapipe_orientation_angle(
+                image,
+                angle
+            )
+
+            mediapipe_candidates.append(result)
+
+            print(
+                f"MediaPipe | Angle={angle}° | "
+                f"Score={result['score']:.4f} | "
+                f"Faces={result['faces']}"
+            )
+
+        valid_mp_candidates = [
+            c for c in mediapipe_candidates
+            if c["faces"] > 0
+        ]
+
+        valid_mp_candidates.sort(
+            key=lambda x: x["score"],
+            reverse=True
+        )
+
+        if valid_mp_candidates:
+
+            best_mp = valid_mp_candidates[0]
+
+            second_mp_score = (
+                valid_mp_candidates[1]["score"]
+                if len(valid_mp_candidates) > 1
+                else 0.0
+            )
+
+            mp_margin = best_mp["score"] - second_mp_score
+
+            if (
+                best_mp["score"] >= MEDIAPIPE_MIN_CONFIDENCE
+                and mp_margin >= MEDIAPIPE_MIN_MARGIN
+            ):
+
+                print(
+                    f"✅ MediaPipe CONFIDENT: {best_mp['angle']}°"
+                )
+
+                return {
+                    "rotation": best_mp["angle"],
+                    "confidence": round(best_mp["score"], 4),
+                    "faces": best_mp["faces"],
+                    "autoRotated": best_mp["angle"] != 0,
+                    "reason": "orientation_detected",
+                    "candidates": candidates
+                }
+
+    except Exception as e:
+
+        print(f"⚠️ MediaPipe fallback failed: {e}")
+
+    # =========================================
+    # STAGE 5: EXIF FALLBACK IF NO FACE
+    # =========================================
+
+    has_exif = False
+    exif_rotation = 0
+
+    if content_bytes is not None:
+
+        has_exif, exif_rotation = get_exif_rotation(
+            content_bytes
+        )
+
+    insight_faces = max(
+        (c["faces"] for c in candidates),
+        default=0
+    )
+
+    mp_faces = max(
+        (c["faces"] for c in mediapipe_candidates),
+        default=0
+    )
+
+    total_detected_faces = max(
+        insight_faces,
+        mp_faces
+    )
+
+    if total_detected_faces == 0:
+
         if has_exif and exif_rotation != 0:
-            print(f"📐 No face, EXIF says {exif_rotation}° -> using EXIF (last resort)")
+
+            print(
+                f"📐 No face detected. "
+                f"Using EXIF: {exif_rotation}°"
+            )
+
             return {
                 "rotation": exif_rotation,
                 "confidence": 0,
@@ -314,7 +652,6 @@ def detect_image_orientation(image, content_bytes=None):
                 "candidates": candidates
             }
 
-        print("⚠️ No face detected & no EXIF hint -> rotation 0")
         return {
             "rotation": 0,
             "confidence": 0,
@@ -324,60 +661,73 @@ def detect_image_orientation(image, content_bytes=None):
             "candidates": candidates
         }
 
-    if best_score < ORIENTATION_MIN_CONFIDENCE:
-        print("⚠️ Low confidence -> rotation 0")
-        return {
-            "rotation": 0,
-            "confidence": round(best_score, 4),
-            "faces": best["faces"],
-            "autoRotated": False,
-            "reason": "low_confidence",
-            "candidates": candidates
-        }
+    # =========================================
+    # STAGE 6: STILL UNCERTAIN
+    # =========================================
 
-    if margin < ORIENTATION_MIN_MARGIN:
-        print("⚠️ Ambiguous orientation")
-        print(f"⚠️ But using best candidate: {best['angle']}°")
-        return {
-            "rotation": best["angle"],
-            "confidence": round(best_score, 4),
-            "faces": best["faces"],
-            "autoRotated": best["angle"] != 0,
-            "reason": "ambiguous_best_candidate_used",
-            "candidates": candidates
-        }
+    print("⚠️ Both models uncertain. Returning uncertain result.")
 
-    print(f"✅ Orientation detected: {best['angle']}°")
+    best_confidence = 0.0
+
+    if valid_candidates:
+        best_confidence = valid_candidates[0]["score"]
+
+    if valid_mp_candidates:
+        best_confidence = max(
+            best_confidence,
+            valid_mp_candidates[0]["score"]
+        )
+
     return {
-        "rotation": best["angle"],
-        "confidence": round(best_score, 4),
-        "faces": best["faces"],
-        "autoRotated": best["angle"] != 0,
-        "reason": "orientation_detected",
+        "rotation": 0,
+        "confidence": round(best_confidence, 4),
+        "faces": total_detected_faces,
+        "autoRotated": False,
+        "reason": "uncertain",
         "candidates": candidates
     }
 
 
+
+
+
 def get_exif_rotation(content_bytes):
+
     """
     Returns (has_tag: bool, rotation: int)
-    EXIF Orientation tag missing hone par has_tag=False —
-    taaki "tag missing" ko "genuine 0" na samjha jaye.
     """
+
     try:
+
         img = Image.open(io.BytesIO(content_bytes))
         exif = img.getexif()
-        orientation_tag = exif.get(274)  
+
+        orientation_tag = exif.get(274)
 
         if orientation_tag is None:
             return False, 0
 
-        rotation = EXIF_ORIENTATION_TO_ROTATION.get(orientation_tag, 0)
+        # Only supported orientation values
+        if orientation_tag not in EXIF_ORIENTATION_TO_ROTATION:
+            return False, 0
+
+        rotation = EXIF_ORIENTATION_TO_ROTATION[orientation_tag]
+
         return True, rotation
 
     except Exception as e:
+
         print(f"⚠️ EXIF read error: {e}")
+
         return False, 0
+
+    finally:
+
+        if "img" in locals():
+            img.close()
+
+
+
 
 @app.post("/detect-orientation")
 async def detect_orientation_api(file: UploadFile = File(...)):
@@ -430,6 +780,45 @@ async def detect_orientation_api(file: UploadFile = File(...)):
 
 
 
+
+def encode_crop_for_memory(crop, quality=85):
+    """
+    NumPy image ko compressed JPEG bytes mein convert karta hai.
+    """
+    if crop is None:
+        return None
+
+    success, encoded = cv2.imencode(
+        ".jpg",
+        crop,
+        [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+    )
+
+    if not success:
+        return None
+
+    return encoded.tobytes()
+
+
+def decode_crop_from_memory(crop_bytes):
+    """
+    Compressed JPEG bytes ko wapas NumPy image banata hai.
+    """
+    if not crop_bytes:
+        return None
+
+    image_array = np.frombuffer(
+        crop_bytes,
+        dtype=np.uint8
+    )
+
+    return cv2.imdecode(
+        image_array,
+        cv2.IMREAD_COLOR
+    )
+
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -438,7 +827,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(event_router)
+# app.include_router(event_router)
         
 
 def delete_subfolder_by_id(subfolder_id: str):
@@ -463,11 +852,22 @@ class FaceSearcher:
     def __init__(self, min_similarity: float = 0.3):
         self.min_similarity = min_similarity
 
+        session_options = ort.SessionOptions()
+        session_options.intra_op_num_threads = 2
+        session_options.inter_op_num_threads = 1
+        session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+
+        session_options.enable_cpu_mem_arena = False
+        session_options.enable_mem_pattern = False
+
         self.app = FaceAnalysis(
-            name="buffalo_s",
-            providers=["CPUExecutionProvider"],
-        )
+        name="buffalo_s",
+        allowed_modules=["detection", "recognition", "landmark_3d_68"],
+        providers=["CPUExecutionProvider"],
+        sess_options=session_options,
+    )
         self.app.prepare(ctx_id=0, det_size=(640, 640))
+        print_memory("AFTER INSIGHTFACE LOAD")
 
     def build_s3_prefix(
         self,
@@ -679,6 +1079,7 @@ async def startup_event():
     # MongoDB connect
     connect_db()
     print("✅ MongoDB connected")
+    
 
 @app.get("/health")
 async def health_check():
@@ -1009,94 +1410,39 @@ MERGE_THRESHOLD = 0.50
 STALE_LOCK_MINUTES = 15
 BLUR_THRESHOLD = 300.0
  
- 
-# =====================================================================
-# NAYA ADDITION #1: CLIP model ek hi baar yaha load hota hai (file ke
-# top pe, function ke bahar) — taaki har baar dubara load na ho.
-# =====================================================================
-_CLIP_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
- 
-_clip_model, _, _clip_preprocess = open_clip.create_model_and_transforms(
-    "ViT-B-32", pretrained="openai"
+ # =========================================================
+# MOBILENETV3 ONNX MODEL INITIALIZATION
+# =========================================================
+
+
+MODEL_PATH = os.path.join(
+    os.path.dirname(__file__),
+    "models",
+    "mobilenetv3_anime_real.onnx"
 )
-_clip_model.eval().to(_CLIP_DEVICE)
-_clip_tokenizer = open_clip.get_tokenizer("ViT-B-32")
+
+session_options = ort.SessionOptions()
+session_options.intra_op_num_threads = 2
+session_options.inter_op_num_threads = 1
+
+session_options.enable_cpu_mem_arena = False
+session_options.enable_mem_pattern = False
+
+session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+mobilenet_session = ort.InferenceSession(
+    MODEL_PATH,
+    sess_options=session_options,
+    providers=["CPUExecutionProvider"]
+)
+
+MOBILENET_INPUT = mobilenet_session.get_inputs()[0].name
+MOBILENET_OUTPUT = mobilenet_session.get_outputs()[0].name
+print_memory("AFTER MOBILENET LOAD")
+
+print("✅ MobileNetV3 loaded successfully")
  
-_REAL_PROMPTS = [
-    "a photo of a real human face",
-    "a close-up photograph of a person's face",
-    "a candid photo of a human face",
-    "a portrait photograph of a real person",
-    "a photo of a real human baby's face",
-]
-_FAKE_PROMPTS = [
-    "a doll's face",
-    "a plastic toy doll face with painted eyes",
-    "a realistic baby doll face, not a real baby",
-    "a cartoon or anime character face",
-    "a statue or sculpture face",
-    "a mannequin face",
-    "an illustration or painting of a face",
-    "a costume or animal mask face",
-    "a toy or action figure face",
-]
- 
-with torch.no_grad():
-    _real_tok = _clip_tokenizer(_REAL_PROMPTS).to(_CLIP_DEVICE)
-    _fake_tok = _clip_tokenizer(_FAKE_PROMPTS).to(_CLIP_DEVICE)
- 
-    _real_emb = _clip_model.encode_text(_real_tok)
-    _fake_emb = _clip_model.encode_text(_fake_tok)
- 
-    _real_emb = _real_emb / _real_emb.norm(dim=-1, keepdim=True)
-    _fake_emb = _fake_emb / _fake_emb.norm(dim=-1, keepdim=True)
- 
-    _REAL_ANCHOR = _real_emb.mean(dim=0, keepdim=True)
-    _FAKE_ANCHOR = _fake_emb.mean(dim=0, keepdim=True)
-    _REAL_ANCHOR = _REAL_ANCHOR / _REAL_ANCHOR.norm(dim=-1, keepdim=True)
-    _FAKE_ANCHOR = _FAKE_ANCHOR / _FAKE_ANCHOR.norm(dim=-1, keepdim=True)
- 
-REAL_FACE_THRESHOLD = 0.68  # apne data pe test karke adjust karein
- 
- 
-# =====================================================================
-# NAYA ADDITION #2: batched filter function — ek image-batch ke saare
-# faces ek saath check karta hai, isliye slow nahi hota.
-# =====================================================================
-def is_real_human_face_batch(face_crops, threshold=REAL_FACE_THRESHOLD, batch_size=64):
-    """
-    face_crops: list of RGB numpy arrays (aapke face crops).
-    Return: list of (is_real: bool, score: float), face_crops ke order mein.
-    """
-    results = [None] * len(face_crops)
-    valid_idx = [i for i, c in enumerate(face_crops) if c is not None and c.size > 0]
- 
-    for start in range(0, len(valid_idx), batch_size):
-        chunk_idx = valid_idx[start:start + batch_size]
-        tensors = torch.stack(
-            [_clip_preprocess(Image.fromarray(face_crops[i])) for i in chunk_idx]
-        ).to(_CLIP_DEVICE)
- 
-        with torch.no_grad():
-            img_emb = _clip_model.encode_image(tensors)
-            img_emb = img_emb / img_emb.norm(dim=-1, keepdim=True)
- 
-            real_sim = (img_emb @ _REAL_ANCHOR.T).squeeze(-1)
-            fake_sim = (img_emb @ _FAKE_ANCHOR.T).squeeze(-1)
- 
-            stacked = torch.stack([real_sim, fake_sim], dim=1) * 100
-            probs = torch.softmax(stacked, dim=1)[:, 0]
- 
-        for local_i, global_i in enumerate(chunk_idx):
-            score = float(probs[local_i])
-            results[global_i] = (score >= threshold, score)
- 
-    for i in range(len(face_crops)):
-        if results[i] is None:
-            results[i] = (False, 0.0)
- 
-    return results
- 
+
 def upload_face_crop(face_crop, folder_id, person_id):
     h, w = face_crop.shape[:2]
     MIN_DP_SIZE = 250
@@ -1174,6 +1520,84 @@ def is_side_face(face_obj):
         print(f"⚠️ is_side_face check failed: {e}")
         return False
 
+def is_real_human_face_batch(face_crops, threshold=0.70, batch_size=8):
+    results = []
+
+    for start in range(0, len(face_crops), batch_size):
+        batch = face_crops[start:start + batch_size]
+        processed = []
+
+        for crop in batch:
+            try:
+                if crop is None or crop.size == 0:
+                    processed.append(None)
+                    continue
+
+                image = Image.fromarray(crop.astype(np.uint8)).convert("RGB")
+
+                image = image.resize(
+                    (384, 384),
+                    Image.Resampling.BILINEAR
+                )
+
+                data = np.asarray(image, dtype=np.float32) / 255.0
+
+                data = np.transpose(data, (2, 0, 1))
+                data = (data - 0.5) / 0.5
+
+                processed.append(data.astype(np.float32))
+
+            except Exception as e:
+                print(f"⚠️ MobileNet preprocessing failed: {e}")
+                processed.append(None)
+
+        valid_indices = [
+            i for i, item in enumerate(processed)
+            if item is not None
+        ]
+
+        if not valid_indices:
+            results.extend([(False, 0.0)] * len(batch))
+            continue
+
+        input_batch = np.stack(
+            [processed[i] for i in valid_indices]
+        ).astype(np.float32)
+
+        try:
+            outputs = mobilenet_session.run(
+                [MOBILENET_OUTPUT],
+                {MOBILENET_INPUT: input_batch}
+            )[0]
+
+            for i, output in enumerate(outputs):
+                # Model labels: anime = 0, real = 1
+                real_score = float(output[1])
+
+                # Output is class scores; convert to probability.
+                scores = np.exp(output - np.max(output))
+                probabilities = scores / np.sum(scores)
+
+                real_probability = float(probabilities[1])
+
+                processed[valid_indices[i]] = (
+                    real_probability >= threshold,
+                    real_probability
+                )
+
+        except Exception as e:
+            print(f"❌ MobileNet inference failed: {e}")
+
+            for idx in valid_indices:
+                processed[idx] = (False, 0.0)
+
+        for item in processed:
+            if item is None:
+                results.append((False, 0.0))
+            else:
+                results.append(item)
+
+    return results
 
 _SMILE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_smile.xml")
 
@@ -1419,476 +1843,834 @@ def cleanup_small_side_face_folders(folderId):
     except Exception as e:
         print(f"❌ Error in cleanup_small_side_face_folders: {str(e)}")
  
- 
 def process_face_clustering_in_background(image_keys, folderId, userId, folder_name, isLastBatch=False):
     if not try_acquire_clustering_lock(folderId, isLastBatch):
         print(f"⏩ Background task SKIPPED for folder {folderId} — already in progress")
         return
     try:
-        print(f"Total Images Found = {len(image_keys)}")
-        all_embeddings = []
-        face_metadata = []
         BATCH_SIZE = 10
-        batches = [
-            image_keys[i:i + BATCH_SIZE]
-            for i in range(0, len(image_keys), BATCH_SIZE)
-        ]
-        # =========================================================
-        # STAGE 1: EXTRACT EMBEDDINGS FROM ALL IMAGES
-        # =========================================================
         DISPLAY_PAD_RATIO = 0.60
+        MIN_GOOD_FACE_SIZE = 90
 
-        for keys in batches:
+        print(f"Total Images Found = {len(image_keys)}")
+
+        # =====================================================
+        # STAGE 0: LOAD EXISTING PERSONS FIRST
+        # =====================================================
+        folder_doc = Folder.objects(id=folderId).first()
+
+        if not folder_doc:
+            print(f"❌ Folder not found: {folderId}")
+            return
+
+        existing_people = []
+
+        for sf in folder_doc.subFolders:
+            sf_embedding = getattr(sf, "embedding", None)
+
+            if (
+                getattr(sf, "isPersonFolder", False)
+                and sf_embedding is not None
+                and len(sf_embedding) > 0
+            ):
+                existing_people.append({
+                    "sub_id": str(sf._id),
+                    "embedding": np.asarray(sf_embedding, dtype=np.float32),
+                    "sf": sf,
+                })
+
+        print(
+            f"🔎 Existing persons loaded FIRST: "
+            f"{len(existing_people)}"
+        )
+
+        valid_subfolders = []
+        merged_count = 0
+        removed_side_count = 0
+
+        # =====================================================
+        # HELPER: SELECT BEST FACE FROM A GROUP
+        # =====================================================
+        def build_group(group_metadata):
+            group = {
+                "images": [],
+                "best_crop_key": None,
+                "best_crop_coords": None,
+                "best_display_coords": None,
+                "max_score": -1,
+                "best_sharpness": -1,
+                "best_is_side": True,
+                "best_is_smile": False,
+                "best_face_size": 0,
+                "best_embedding": None,
+                "all_frontal_embeddings": [],
+            }
+
+            for metadata in group_metadata:
+                key = metadata["key"]
+
+                if key not in group["images"]:
+                    group["images"].append(key)
+
+                if not metadata["is_side"]:
+                    group["all_frontal_embeddings"].append(
+                        metadata["embedding"]
+                    )
+
+                # Best face selection ke liye image load
+                image = read_s3_image(key)
+
+                if image is None:
+                    continue
+
+                x1 = metadata["crop_x1"]
+                y1 = metadata["crop_y1"]
+                x2 = metadata["crop_x2"]
+                y2 = metadata["crop_y2"]
+
+                crop = image[y1:y2, x1:x2]
+
+                if crop.size == 0:
+                    continue
+
+                sharpness = compute_sharpness(crop)
+                face_size = min(
+                    metadata["face_w"],
+                    metadata["face_h"]
+                )
+
+                new_priority = (
+                    1 if face_size >= MIN_GOOD_FACE_SIZE else 0,
+                    0 if metadata["is_side"] else 1,
+                    1 if metadata["is_smile"] else 0,
+                )
+
+                old_priority = (
+                    1 if group["best_face_size"] >= MIN_GOOD_FACE_SIZE else 0,
+                    0 if group["best_is_side"] else 1,
+                    1 if group["best_is_smile"] else 0,
+                )
+
+                should_replace = False
+
+                if group["best_crop_key"] is None:
+                    should_replace = True
+
+                elif new_priority > old_priority:
+                    should_replace = True
+
+                elif new_priority == old_priority:
+                    det_close = (
+                        metadata["det_score"]
+                        >= group["max_score"] - 0.05
+                    )
+
+                    if (
+                        sharpness > group["best_sharpness"]
+                        and det_close
+                    ):
+                        should_replace = True
+
+                    elif (
+                        metadata["det_score"]
+                        > group["max_score"] + 0.05
+                    ):
+                        should_replace = True
+
+                if should_replace:
+                    group["best_crop_key"] = key
+
+                    group["best_crop_coords"] = (
+                        x1, y1, x2, y2
+                    )
+
+                    group["best_display_coords"] = (
+                        metadata["disp_x1"],
+                        metadata["disp_y1"],
+                        metadata["disp_x2"],
+                        metadata["disp_y2"],
+                    )
+
+                    group["max_score"] = metadata["det_score"]
+                    group["best_sharpness"] = sharpness
+                    group["best_is_side"] = metadata["is_side"]
+                    group["best_is_smile"] = metadata["is_smile"]
+                    group["best_face_size"] = face_size
+                    group["best_embedding"] = metadata["embedding"]
+
+            if group["best_crop_key"] is None:
+                return None
+
+            return group
+
+        # =====================================================
+        # STAGE 1: PROCESS IMAGES 10-10
+        # =====================================================
+        for batch_number, start in enumerate(
+            range(0, len(image_keys), BATCH_SIZE),
+            start=1
+        ):
+            keys = image_keys[start:start + BATCH_SIZE]
+
+            print(
+                f"\n📦 Processing Batch {batch_number} "
+                f"| Images: {len(keys)}"
+            )
+
+            print_memory(f"BATCH {batch_number} - BEFORE IMAGE LOAD")
+
+
             imgs = [read_s3_image(k) for k in keys]
+
+            batch_images = {
+                key: img
+                for key, img in zip(keys, imgs)
+                if img is not None
+            }
+
+            print_memory(f"BATCH {batch_number} - AFTER IMAGE LOAD")
+
             batch_candidates = []
+
             for img, key in zip(imgs, keys):
                 if img is None:
                     continue
+
                 faces = searcher.app.get(img)
-                if not faces:
-                    continue
+
                 for face in faces:
-                    det_score = getattr(face, 'det_score', 1.0)
+                    det_score = float(
+                        getattr(face, "det_score", 1.0)
+                    )
+
                     if det_score < 0.65:
                         continue
+
                     x1, y1, x2, y2 = map(int, face.bbox)
-                    face_w, face_h = x2 - x1, y2 - y1
+
+                    face_w = x2 - x1
+                    face_h = y2 - y1
+
                     if face_w < 35 or face_h < 35:
                         continue
 
-                    pad_x, pad_y = int(face_w * 0.20), int(face_h * 0.20)
                     h, w = img.shape[:2]
+
+                    pad_x = int(face_w * 0.20)
+                    pad_y = int(face_h * 0.20)
+
                     crop_x1 = max(0, x1 - pad_x)
                     crop_y1 = max(0, y1 - pad_y)
                     crop_x2 = min(w, x2 + pad_x)
                     crop_y2 = min(h, y2 + pad_y)
-                    face_crop = img[crop_y1:crop_y2, crop_x1:crop_x2]
+
+                    face_crop = img[
+                        crop_y1:crop_y2,
+                        crop_x1:crop_x2
+                    ]
+
                     if face_crop.size == 0:
-                        face_crop = img[y1:y2, x1:x2]
+                        continue
 
                     disp_pad_x = int(face_w * DISPLAY_PAD_RATIO)
                     disp_pad_y = int(face_h * DISPLAY_PAD_RATIO)
+
                     disp_x1 = max(0, x1 - disp_pad_x)
                     disp_y1 = max(0, y1 - disp_pad_y)
                     disp_x2 = min(w, x2 + disp_pad_x)
                     disp_y2 = min(h, y2 + disp_pad_y)
-                    display_crop = img[disp_y1:disp_y2, disp_x1:disp_x2]
-                    if display_crop.size == 0:
-                        display_crop = face_crop
 
                     if is_blurry_face(face_crop):
                         print(f"🚫 Blurry face rejected: {key}")
                         continue
 
-                    side_flag = is_side_face(face)
-                    smile_flag = is_smiling_face(face_crop)
-
                     batch_candidates.append({
                         "key": key,
-                        "face_crop": face_crop.copy(),
-                        "display_crop": display_crop.copy(),
+                        "crop_x1": crop_x1,
+                        "crop_y1": crop_y1,
+                        "crop_x2": crop_x2,
+                        "crop_y2": crop_y2,
+                        "disp_x1": disp_x1,
+                        "disp_y1": disp_y1,
+                        "disp_x2": disp_x2,
+                        "disp_y2": disp_y2,
                         "det_score": det_score,
-                        "embedding": face.embedding,
-                        "is_side": side_flag,
-                        "is_smile": smile_flag,
+                        "embedding": np.asarray(
+                            face.embedding,
+                            dtype=np.float32
+                        ),
+                        "is_side": is_side_face(face),
+                        "is_smile": is_smiling_face(face_crop),
                         "face_w": face_w,
                         "face_h": face_h,
                     })
-                # ^ "for face in faces:" loop yaha khatam
-            # ^ "for img, key in zip(imgs, keys):" loop bhi yaha khatam
+
+            print_memory(f"BATCH {batch_number} - AFTER INSIGHTFACE")
+
+
             if not batch_candidates:
+                print("⚠️ No face candidates in this batch")
+
+                del imgs
+                del batch_images
+                del batch_candidates
                 continue
-            # =====================================================
-            # CLIP filter
-            # =====================================================
-            crops = [c["face_crop"] for c in batch_candidates]
+
+            # =================================================
+            # STAGE 2: MOBILENET HUMAN FACE FILTER
+            # =================================================
+            crops = [
+                batch_images[c["key"]][
+                    c["crop_y1"]:c["crop_y2"],
+                    c["crop_x1"]:c["crop_x2"]
+                ]
+                for c in batch_candidates
+            ]
+
             human_results = is_real_human_face_batch(crops)
 
-            for candidate, (is_human, score) in zip(batch_candidates, human_results):
+            print_memory(f"BATCH {batch_number} - AFTER MOBILENET")
+
+            valid_candidates = []
+
+            for candidate, (is_human, score) in zip(
+                batch_candidates,
+                human_results
+            ):
                 if not is_human:
-                    print(f"🚫 Non-human face rejected (score={score:.2f}): {candidate['key']}")
+                    print(
+                        f"🚫 Non-human rejected "
+                        f"(score={score:.2f}): {candidate['key']}"
+                    )
                     continue
 
-                all_embeddings.append(candidate["embedding"])
-                face_metadata.append({
-                    "key": candidate["key"],
-                    "face_crop": candidate["face_crop"],
-                    "display_crop": candidate["display_crop"],
-                    "det_score": candidate["det_score"],
-                    "is_side": candidate["is_side"],
-                    "is_smile": candidate["is_smile"],
-                    "face_w": candidate["face_w"],
-                    "face_h": candidate["face_h"],
-                    "embedding": candidate["embedding"],
-                })
-        if not all_embeddings:
-            print("⚠️ No faces detected in the given images.")
-            Folder.objects(id=folderId).update_one(
-                set__clusteringStatus="DONE",
-            )
-            return
-        # =========================================================
-        # STAGE 2: DBSCAN CLUSTERING
-        # =========================================================
-        np_embeddings = np.array(all_embeddings)
-        clustering = DBSCAN(eps=EPS, min_samples=MIN_SAMPLES, metric="cosine")
-        labels = clustering.fit_predict(np_embeddings)
-        cluster_groups = {}
-        noise_id_counter = -2
+                valid_candidates.append(candidate)
 
-        MIN_GOOD_FACE_SIZE = 90  
+            del crops
+            del human_results
+            del batch_candidates
+            del imgs
+            del batch_images
 
-        for label, metadata in zip(labels, face_metadata):
-            if label == -1:
-                current_group_id = noise_id_counter
-                noise_id_counter -= 1
-            else:
-                current_group_id = label
-
-            crop_sharpness = compute_sharpness(metadata["face_crop"])
-            face_size = min(metadata["face_w"], metadata["face_h"])
-
-            if current_group_id not in cluster_groups:
-                emb = metadata["embedding"]
-
-                cluster_groups[current_group_id] = {
-                    "images": [],
-                    "best_crop": metadata["face_crop"],
-                    "best_display_crop": metadata["display_crop"],
-                    "max_score": metadata["det_score"],
-                    "best_sharpness": crop_sharpness,
-                    "best_is_side": metadata["is_side"],
-                    "best_is_smile": metadata["is_smile"],
-                    "best_face_size": face_size,
-                    "best_embedding": emb,
-                    "all_frontal_embeddings": [] if metadata["is_side"] else [metadata["embedding"]],
-                }
-
-            else:
-                if not metadata["is_side"]:
-                    cluster_groups[current_group_id]["all_frontal_embeddings"].append(metadata["embedding"])
-
-            if metadata["key"] not in cluster_groups[current_group_id]["images"]:
-                cluster_groups[current_group_id]["images"].append(metadata["key"])
-
-            group = cluster_groups[current_group_id]
-
-            new_good_size = 1 if face_size >= MIN_GOOD_FACE_SIZE else 0
-            old_good_size = 1 if group["best_face_size"] >= MIN_GOOD_FACE_SIZE else 0
-
-            new_priority = (new_good_size, 0 if metadata["is_side"] else 1, 1 if metadata["is_smile"] else 0)
-            old_priority = (old_good_size, 0 if group["best_is_side"] else 1, 1 if group["best_is_smile"] else 0)
-
-            if new_priority > old_priority:
-                group["best_crop"] = metadata["face_crop"]
-                group["best_display_crop"] = metadata["display_crop"]
-                group["max_score"] = metadata["det_score"]
-                group["best_sharpness"] = crop_sharpness
-                group["best_is_side"] = metadata["is_side"]
-                group["best_is_smile"] = metadata["is_smile"]
-                group["best_face_size"] = face_size
-
-            elif new_priority == old_priority:
-                current_best_det = group["max_score"]
-                current_best_sharp = group["best_sharpness"]
-
-                det_close_enough = metadata["det_score"] >= (current_best_det - 0.05)
-                is_sharper = crop_sharpness > current_best_sharp
-
-                if is_sharper and det_close_enough:
-                    group["best_crop"] = metadata["face_crop"]
-                    group["best_display_crop"] = metadata["display_crop"]
-                    group["best_sharpness"] = crop_sharpness
-                    group["best_is_side"] = metadata["is_side"]
-                    group["best_is_smile"] = metadata["is_smile"]
-                    group["best_face_size"] = face_size
-                    if metadata["det_score"] > current_best_det:
-                        group["max_score"] = metadata["det_score"]
-                elif metadata["det_score"] > current_best_det + 0.05:
-                    group["best_crop"] = metadata["face_crop"]
-                    group["best_display_crop"] = metadata["display_crop"]
-                    group["max_score"] = metadata["det_score"]
-                    group["best_sharpness"] = crop_sharpness
-                    group["best_is_side"] = metadata["is_side"]
-                    group["best_is_smile"] = metadata["is_smile"]
-                    group["best_face_size"] = face_size
-            # else: purana wala hi better hai, kuch mat karo
-
-        print(f"🧩 DBSCAN se {len(cluster_groups)} cluster(s) bane is run me (EPS={EPS})")
-
-
-        # =========================================================
-        # STAGE 3: TAGGING & SIDE-FACE CLEANUP (WITH CROSS-RUN MATCHING)
-        # =========================================================
-        print("\n🚀 STARTING IMAGE TAGGING & CLEANUP PROCESS")
-        valid_subfolders = []
-        removed_side_count = 0
-        merged_count = 0
-
-        folder_doc_for_match = Folder.objects(id=folderId).first()
-        existing_people = []
-        if folder_doc_for_match:
-            for sf in folder_doc_for_match.subFolders:
-                sf_embedding = getattr(sf, "embedding", None)
-                if getattr(sf, "isPersonFolder", False) and sf_embedding:
-                    existing_people.append({
-                        "sub_id": str(sf._id),
-                        "embedding": np.array(sf_embedding)
-                    })
-
-        print(f"🔎 {len(existing_people)} existing person(s) loaded for matching")
-
-        for group_id, group_data in cluster_groups.items():
-
-            representative_embedding = compute_cluster_embedding(group_data)
-
-            print(f"\n--- Processing cluster group_id={group_id} | images_in_cluster={len(group_data['images'])} | is_side={group_data['best_is_side']} ---")
-
-            matched_sub_id = find_matching_person(representative_embedding, existing_people)
-
-            group_keys = group_data["images"]
-            group_filenames = [k.split("/")[-1] for k in group_keys if "/" in k]
-
-            if matched_sub_id:
-                # ===================== MERGE PATH =====================
-                sub_id = matched_sub_id
-                try:
-                    folder_filter = Q(mainFolderId=folderId)
-                    key_filter = (
-                        Q(thumbnailKey__in=group_keys) |
-                        Q(originalKey__in=group_keys) |
-                        Q(thumbnailKey__in=group_filenames) |
-                        Q(originalKey__in=group_filenames)
-                    )
-                    WebLinks.objects(folder_filter & key_filter).update(add_to_set__folderIds=sub_id)
-                except Exception as e:
-                    print(f"❌ Failed Bulk Tagging (merge) for Subfolder {sub_id}: {str(e)}")
-
-                actual_tagged_count = WebLinks.objects(folderIds=sub_id).count()
-                merged_count += 1
-                print(f"🔁 MERGED into existing person {sub_id} — new tagged count: {actual_tagged_count}")
-
-                if folder_doc_for_match:
-                    for sf in folder_doc_for_match.subFolders:
-                        if str(sf._id) == sub_id:
-                            old_person_count = sf.personCount or 1
-                            sf.personCount = actual_tagged_count
-
-                            old_emb = getattr(sf, "embedding", None)
-                            if old_emb is not None and len(old_emb) > 0:
-                                updated_emb = update_running_centroid(
-                                    old_emb,
-                                    old_person_count,
-                                    representative_embedding
-                                )
-                                sf.embedding = list(map(float, updated_emb))
-
-                                for p in existing_people:
-                                    if p["sub_id"] == sub_id:
-                                        p["embedding"] = updated_emb
-                                        break
-                            break
-
+            if not valid_candidates:
                 continue
 
-            # ===================== CREATE PATH (naya person) =====================
+            # =================================================
+            # STAGE 3: EXISTING PERSON MATCHING FIRST
+            # =================================================
+            matched_groups = {}
+            unmatched_candidates = []
 
-            try:
-                _gray_check = cv2.cvtColor(group_data["best_crop"], cv2.COLOR_RGB2GRAY)
-                _final_variance = cv2.Laplacian(_gray_check, cv2.CV_64F).var()
-                print(f"🖼️ FOLDER CROP VARIANCE = {_final_variance:.2f} (group_id={group_id})")
-            except Exception as _e:
-                print(f"⚠️ Folder crop variance check failed: {_e}")
-
-            person_id = str(uuid.uuid4())
-            crop_key, crop_url = upload_face_crop(
-                group_data["best_display_crop"],
-                folderId,
-                person_id
-            )
-            sub_id = str(bson.ObjectId())
-
-            try:
-                folder_filter = Q(mainFolderId=folderId)
-                key_filter = (
-                    Q(thumbnailKey__in=group_keys) |
-                    Q(originalKey__in=group_keys) |
-                    Q(thumbnailKey__in=group_filenames) |
-                    Q(originalKey__in=group_filenames)
+            for candidate in valid_candidates:
+                matched_sub_id = find_matching_person(
+                    candidate["embedding"],
+                    existing_people
                 )
-                WebLinks.objects(folder_filter & key_filter).update(add_to_set__folderIds=sub_id)
-            except Exception as e:
-                print(f"❌ Failed Bulk Tagging for Subfolder {sub_id}: {str(e)}")
 
-            actual_tagged_count = WebLinks.objects(folderIds=sub_id).count()
-            print(f"📊 Subfolder {sub_id} tagged count: {actual_tagged_count}")
+                if matched_sub_id:
+                    matched_groups.setdefault(
+                        matched_sub_id, []
+                    ).append(candidate)
 
-            if group_data["best_is_side"] is True and actual_tagged_count <= 2:
-                removed_side_count += 1
-                print(f"🔍 SIDE-FACE FILTER (Count={actual_tagged_count}): Deleting crop & untagging subfolder {sub_id}")
+                    print(
+                        f"✅ Existing person matched: "
+                        f"{matched_sub_id} | {candidate['key']}"
+                    )
+                else:
+                    unmatched_candidates.append(candidate)
 
-                try:
-                    s3.delete_object(Bucket=S3_BUCKET, Key=crop_key)
-                except Exception as s3_err:
-                    print(f"⚠️ S3 delete failed for {sub_id}: {s3_err}")
+            # =================================================
+            # STAGE 4: TAG MATCHED EXISTING PERSONS
+            # =================================================
+            for sub_id, matched_faces in matched_groups.items():
 
-                try:
-                    WebLinks.objects(folderIds=sub_id).update(pull__folderIds=sub_id)
-                except Exception as tag_err:
-                    print(f"⚠️ Untagging failed for {sub_id}: {tag_err}")
-            else:
-                subfolder = SubFolder(
-                    _id=sub_id,
-                    folderName="Person",
-                    type="others",
-                    userId=userId,
-                    personCount=actual_tagged_count,
-                    isPersonFolder=True,
-                    isSideFace=group_data["best_is_side"],
-                    embedding=list(map(float, representative_embedding)),
-                    folderDp={
-                        "fileUrl": crop_url,
-                        "thumbnailUrl": crop_url,
-                        "s3Key": crop_key,
-                        "thumbnailKey": crop_key
-                    }
-                )
-                valid_subfolders.append(subfolder)
-
-                existing_people.append({
-                    "sub_id": sub_id,
-                    "embedding": representative_embedding
+                group_keys = list({
+                    face["key"] for face in matched_faces
                 })
 
-        print(f"✅ TAGGING & CLEANUP COMPLETED "
-              f"(New: {len(valid_subfolders)}, Merged: {merged_count}, "
-              f"Filtered side-face: {removed_side_count})")
+                group_filenames = [
+                    key.split("/")[-1]
+                    for key in group_keys
+                    if "/" in key
+                ]
 
-        # =========================================================
-        # STAGE 4: FINAL DB SAVE
-        # =========================================================
+                try:
+                    folder_filter = Q(mainFolderId=folderId)
+
+                    key_filter = (
+                        Q(thumbnailKey__in=group_keys)
+                        | Q(originalKey__in=group_keys)
+                        | Q(thumbnailKey__in=group_filenames)
+                        | Q(originalKey__in=group_filenames)
+                    )
+
+                    WebLinks.objects(
+                        folder_filter & key_filter
+                    ).update(add_to_set__folderIds=sub_id)
+
+                except Exception as e:
+                    print(
+                        f"❌ Existing person tagging failed "
+                        f"{sub_id}: {e}"
+                    )
+
+                actual_count = WebLinks.objects(
+                    folderIds=sub_id
+                ).count()
+
+                person_data = next(
+                    (
+                        p for p in existing_people
+                        if p["sub_id"] == sub_id
+                    ),
+                    None
+                )
+
+                if person_data:
+                    sf = person_data["sf"]
+
+                    old_count = sf.personCount or 1
+
+                    frontal_embeddings = [
+                        f["embedding"]
+                        for f in matched_faces
+                        if not f["is_side"]
+                    ]
+
+                    # Frontal embeddings ko preference
+                    if frontal_embeddings:
+                        new_embedding = np.mean(
+                            np.asarray(
+                                frontal_embeddings,
+                                dtype=np.float32
+                            ),
+                            axis=0
+                        )
+                    else:
+                        new_embedding = matched_faces[0]["embedding"]
+
+                    updated_embedding = update_running_centroid(
+                        person_data["embedding"],
+                        old_count,
+                        new_embedding
+                    )
+
+                    person_data["embedding"] = np.asarray(
+                        updated_embedding,
+                        dtype=np.float32
+                    )
+
+                    sf.embedding = list(
+                        map(float, updated_embedding)
+                    )
+
+                    sf.personCount = actual_count
+
+                merged_count += 1
+
+                print(
+                    f"🔁 Existing person updated: {sub_id} "
+                    f"| Tagged count: {actual_count}"
+                )
+
+            # =================================================
+            # STAGE 5: DBSCAN ONLY ON UNMATCHED FACES
+            # =================================================
+            if unmatched_candidates:
+
+                print(
+                    f"🧩 Unmatched faces for DBSCAN: "
+                    f"{len(unmatched_candidates)}"
+                )
+
+                unmatched_embeddings = np.asarray(
+                    [
+                        c["embedding"]
+                        for c in unmatched_candidates
+                    ],
+                    dtype=np.float32
+                )
+
+                clustering = DBSCAN(
+                    eps=EPS,
+                    min_samples=MIN_SAMPLES,
+                    metric="cosine"
+                )
+
+                labels = clustering.fit_predict(
+                    unmatched_embeddings
+                )
+
+                del clustering
+                del unmatched_embeddings
+
+                batch_groups = {}
+
+
+                for label, candidate in zip(labels, unmatched_candidates):
+
+                    if label == -1:
+                       print(
+                        f"⏭️ DBSCAN noise face skipped: {candidate['key']}"
+                       )
+                       continue
+
+                    group_id = int(label)
+
+                    batch_groups.setdefault(
+                        group_id, []
+                    ).append(candidate)
+
+                print(
+                    f"🧩 New batch clusters: "
+                    f"{len(batch_groups)}"
+                )
+
+                # =============================================
+                # STAGE 6: CREATE ONLY UNMATCHED NEW PERSONS
+                # =============================================
+                for group_id, group_candidates in batch_groups.items():
+
+                    group_data = build_group(group_candidates)
+
+                    if not group_data:
+                        continue
+
+                    representative_embedding = (
+                        compute_cluster_embedding(group_data)
+                    )
+
+                    group_keys = group_data["images"]
+
+                    group_filenames = [
+                        key.split("/")[-1]
+                        for key in group_keys
+                        if "/" in key
+                    ]
+
+                    best_image = read_s3_image(
+                        group_data["best_crop_key"]
+                    )
+
+                    if best_image is None:
+                        print(
+                            f"⚠️ Best image not found: "
+                            f"{group_data['best_crop_key']}"
+                        )
+                        continue
+
+                    x1, y1, x2, y2 = (
+                        group_data["best_crop_coords"]
+                    )
+
+                    dx1, dy1, dx2, dy2 = (
+                        group_data["best_display_coords"]
+                    )
+
+                    face_crop = best_image[y1:y2, x1:x2]
+                    display_crop = best_image[dy1:dy2, dx1:dx2]
+
+                    if (
+                        face_crop.size == 0
+                        or display_crop.size == 0
+                    ):
+                        print(
+                            f"⚠️ Invalid crop for group {group_id}"
+                        )
+                        continue
+
+                    person_id = str(uuid.uuid4())
+
+                    crop_key, crop_url = upload_face_crop(
+                        display_crop,
+                        folderId,
+                        person_id
+                    )
+
+                    del best_image
+                    del face_crop
+                    del display_crop
+
+                    sub_id = str(bson.ObjectId())
+
+                    try:
+                        folder_filter = Q(mainFolderId=folderId)
+
+                        key_filter = (
+                            Q(thumbnailKey__in=group_keys)
+                            | Q(originalKey__in=group_keys)
+                            | Q(thumbnailKey__in=group_filenames)
+                            | Q(originalKey__in=group_filenames)
+                        )
+
+                        WebLinks.objects(
+                            folder_filter & key_filter
+                        ).update(add_to_set__folderIds=sub_id)
+
+                    except Exception as e:
+                        print(
+                            f"❌ New person tagging failed "
+                            f"{sub_id}: {e}"
+                        )
+
+                    actual_count = WebLinks.objects(
+                        folderIds=sub_id
+                    ).count()
+
+                    # Existing side-face cleanup behavior
+                    if (
+                        group_data["best_is_side"] is True
+                        and actual_count <= 2
+                    ):
+                        removed_side_count += 1
+
+                        print(
+                            f"🔍 SIDE-FACE FILTER "
+                            f"(Count={actual_count}): {sub_id}"
+                        )
+
+                        try:
+                            s3.delete_object(
+                                Bucket=S3_BUCKET,
+                                Key=crop_key
+                            )
+                        except Exception as e:
+                            print(
+                                f"⚠️ S3 crop delete failed: {e}"
+                            )
+
+                        WebLinks.objects(
+                            folderIds=sub_id
+                        ).update(pull__folderIds=sub_id)
+
+                        continue
+
+                    subfolder = SubFolder(
+                        _id=sub_id,
+                        folderName="Person",
+                        type="others",
+                        userId=userId,
+                        personCount=actual_count,
+                        isPersonFolder=True,
+                        isSideFace=group_data["best_is_side"],
+                        embedding=list(
+                            map(float, representative_embedding)
+                        ),
+                        folderDp={
+                            "fileUrl": crop_url,
+                            "thumbnailUrl": crop_url,
+                            "s3Key": crop_key,
+                            "thumbnailKey": crop_key,
+                        }
+                    )
+
+                    valid_subfolders.append(subfolder)
+
+                    # IMPORTANT:
+                    # Naya person immediately existing_people mein add.
+                    # Next batch isi embedding se match kar sakta hai.
+                    existing_people.append({
+                        "sub_id": sub_id,
+                        "embedding": np.asarray(
+                            representative_embedding,
+                            dtype=np.float32
+                        ),
+                        "sf": subfolder,
+                    })
+
+                    print(
+                        f"🆕 New person created: {sub_id} "
+                        f"| Batch: {batch_number}"
+                    )
+
+            del valid_candidates
+            del unmatched_candidates
+            del matched_groups
+
+            gc.collect()
+
+            print_memory(f"BATCH {batch_number} - AFTER CLEANUP")
+
+        # =====================================================
+        # STAGE 7: FINAL DB SAVE
+        # =====================================================
         folder_doc = Folder.objects(id=folderId).first()
+
         if not folder_doc:
-            print("❌ Folder not found in background task")
+            print("❌ Folder not found during final save")
             return
 
-        current_ai_person_count = folder_doc.totalPersonCount or 0
+        current_person_count = folder_doc.totalPersonCount or 0
 
         folder_doc.subFolders.extend(valid_subfolders)
-        folder_doc.totalPersonCount = current_ai_person_count + len(valid_subfolders)
-        folder_doc.uniqueFaceCount = (folder_doc.uniqueFaceCount or 0) + len(valid_subfolders)
 
-        if folder_doc_for_match:
-            updated_counts = {str(sf._id): sf.personCount for sf in folder_doc_for_match.subFolders}
-            updated_embeddings = {str(sf._id): getattr(sf, "embedding", None) for sf in folder_doc_for_match.subFolders}
-            for sf in folder_doc.subFolders:
-                sid = str(sf._id)
-                if sid in updated_counts:
-                    sf.personCount = updated_counts[sid]
-                if updated_embeddings.get(sid):
-                    sf.embedding = updated_embeddings[sid]
+        folder_doc.totalPersonCount = (
+            current_person_count + len(valid_subfolders)
+        )
+
+        folder_doc.uniqueFaceCount = (
+            (folder_doc.uniqueFaceCount or 0)
+            + len(valid_subfolders)
+        )
+
+        # Existing matched persons ki updated embeddings/counts save
+        for person in existing_people:
+            sf = person["sf"]
+
+            for db_sf in folder_doc.subFolders:
+                if str(db_sf._id) == person["sub_id"]:
+                    db_sf.personCount = sf.personCount
+                    db_sf.embedding = sf.embedding
+                    break
 
         folder_doc.save()
-        print("✅ Folder Database Setup Success - All verified subfolders saved to DB")
 
-        # =========================================================
-        # STAGE 5: BANNER GENERATION
-        # =========================================================
+        print(
+            f"✅ FINAL SAVE COMPLETED "
+            f"| New: {len(valid_subfolders)} "
+            f"| Merged: {merged_count} "
+            f"| Side filtered: {removed_side_count}"
+        )
+
+        # =====================================================
+        # STAGE 8: LAST BATCH / BANNER HANDLING
+        # =====================================================
         folder_doc_check = Folder.objects(id=folderId).first()
-        pending_flag = getattr(folder_doc_check, "pendingLastBatch", False) if folder_doc_check else False
+
+        pending_flag = (
+            getattr(folder_doc_check, "pendingLastBatch", False)
+            if folder_doc_check else False
+        )
 
         if pending_flag:
-            print(f"📌 Pending isLastBatch flag mila — naye images ke liye FRESH re-run trigger karenge")
+            print(
+                "📌 Pending last batch found — "
+                "fresh processing trigger"
+            )
+
             Folder.objects(id=folderId).update_one(
                 set__pendingLastBatch=False,
                 set__clusteringStatus="DONE"
             )
 
             fresh_image_keys = list_s3_images(folder_name)
-            print(f"🔁 Fresh re-run: {len(fresh_image_keys)} images found in S3")
 
             process_face_clustering_in_background(
-                fresh_image_keys, folderId, userId, folder_name, isLastBatch=True
+                fresh_image_keys,
+                folderId,
+                userId,
+                folder_name,
+                isLastBatch=True
             )
+
             return
 
         if isLastBatch:
             print("🎨 Last batch received, generating banner...")
 
-            raw_order_id = getattr(folder_doc, 'orderId', None) if folder_doc else 'N/A'
-            display_order_id = int(raw_order_id) + 10800 if str(raw_order_id).isdigit() else raw_order_id
-            event_id = getattr(folder_doc, "eventId", None) if folder_doc else None
+            raw_order_id = getattr(
+                folder_doc, "orderId", None
+            )
+
+            display_order_id = (
+                int(raw_order_id) + 10800
+                if str(raw_order_id).isdigit()
+                else raw_order_id
+            )
 
             Folder.objects(id=folderId).update_one(
                 set__clusteringStatus="DONE"
             )
 
-            print(f"🎨 Generating Best Banner Image for Folder (Order ID: {display_order_id})...")
+            print(
+                f"🎨 Generating banner for Order: "
+                f"{display_order_id}"
+            )
 
-            banner_result = generate_and_save_folder_banner(folderId=folderId)
+            banner_result = generate_and_save_folder_banner(
+                folderId=folderId
+            )
 
             if banner_result.get("success"):
-                    banner_url = banner_result.get("bannerUrl")
-                    print(f"🎉 Banner automatically assigned: {banner_url}")
+                banner_url = banner_result.get("bannerUrl")
 
-                    NODE_API_URL = "https://horaservices.com/api/internal/generate-banner"
+                print(
+                    f"🎉 Banner automatically assigned: "
+                    f"{banner_url}"
+                )
 
-                    try:
-                        img_response = requests.get(banner_url, timeout=10)
-                        img_response.raise_for_status()
+                NODE_API_URL = (
+                    "https://horaservices.com/api/internal/generate-banner"
+                )
 
-                        image_bytes = io.BytesIO(img_response.content)
+                try:
+                    img_response = requests.get(
+                        banner_url,
+                        timeout=10
+                    )
+                    img_response.raise_for_status()
 
-                        payload = {
-                            "folderId": str(folderId),
-                        }
+                    image_bytes = io.BytesIO(
+                        img_response.content
+                    )
 
-                        files = {
-                            "leftImage": ("left_image.jpg", image_bytes, "image/jpeg")
-                        }
-
-                        response = requests.post(
-                            NODE_API_URL,
-                            data=payload,
-                            files=files,
-                            timeout=30
-                        )
-
-                        res_data = response.json()
-
-                        if response.status_code == 200 and res_data.get("success"):
-                            print(
-                                f"✅ Node.js Canvas Banner Generated & Saved: "
-                                f"{res_data.get('bannerUrl')}"
+                    response = requests.post(
+                        NODE_API_URL,
+                        data={"folderId": str(folderId)},
+                        files={
+                            "leftImage": (
+                                "left_image.jpg",
+                                image_bytes,
+                                "image/jpeg"
                             )
-                        else:
-                            print(
-                                f"❌ Node.js API Error: "
-                                f"{res_data.get('error') or res_data.get('message')}"
-                            )
+                        },
+                        timeout=30
+                    )
 
-                        image_bytes.close()
+                    res_data = response.json()
 
-                    except Exception as req_err:
+                    if (
+                        response.status_code == 200
+                        and res_data.get("success")
+                    ):
                         print(
-                            f"❌ Error while calling Node.js Banner API: "
-                            f"{str(req_err)}"
+                            "✅ Node.js Canvas Banner Generated & Saved"
                         )
+                    else:
+                        print(
+                            f"❌ Node.js API Error: "
+                            f"{res_data.get('error') or res_data.get('message')}"
+                        )
+
+                    image_bytes.close()
+
+                except Exception as req_err:
+                    print(
+                        f"❌ Node.js Banner API Error: {req_err}"
+                    )
 
             else:
-                    print("⚠️ Banner generation failed")
+                print("⚠️ Banner generation failed")
 
         else:
             Folder.objects(id=folderId).update_one(
                 set__clusteringStatus="DONE"
             )
-            print("⏩ Not last batch, banner generation skipped")
+
+            print(
+                "⏩ Not last batch, banner generation skipped"
+            )
 
     except Exception as e:
-        print(f"❌ Error in background face recognition: {str(e)}")
+        print(
+            f"❌ Error in background face recognition: {str(e)}"
+        )
+
         Folder.objects(id=folderId).update_one(
             set__clusteringStatus="FAILED"
         )
+
+
  
 @app.post("/count-unique-persons")
 async def count_unique_persons(
@@ -2034,3 +2816,4 @@ async def serve_index():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+    print_memory("SERVER START")
