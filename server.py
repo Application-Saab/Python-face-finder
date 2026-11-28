@@ -8,6 +8,7 @@ from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from insightface.app import FaceAnalysis
+import onnxruntime as ort
 from numpy.linalg import norm
 import numpy as np
 import os
@@ -41,6 +42,21 @@ from mongoengine.queryset.visitor import Q
 from datetime import datetime, timedelta
 import mediapipe as mp
 import threading
+
+
+import psutil
+import os
+
+def print_memory(label):
+    process = psutil.Process(os.getpid())
+    mem = process.memory_full_info()
+
+    rss_mb = mem.rss / (1024 * 1024)
+    uss_mb = getattr(mem, "uss", 0) / (1024 * 1024)
+
+    print(f"\n========== {label} ==========")
+    print(f"RSS: {rss_mb:.2f} MB | USS: {uss_mb:.2f} MB")
+    print("============================\n")
 
 
 s3_client = boto3.client('s3') 
@@ -85,28 +101,6 @@ EXIF_ORIENTATION_TO_ROTATION = {
 
 _face_landmarker = None
 _face_landmarker_lock = threading.Lock()
-
-
-def resize_for_orientation_detection(image, max_size=1600):
-    """
-    AI ke liye image ko chhota karta hai.
-    Original image ko modify nahi karta.
-    """
-    height, width = image.shape[:2]
-    largest = max(width, height)
-
-    if largest <= max_size:
-        return image
-
-    scale = max_size / largest
-    new_width = int(width * scale)
-    new_height = int(height * scale)
-
-    return cv2.resize(
-        image,
-        (new_width, new_height),
-        interpolation=cv2.INTER_AREA
-    )
 
 
 def rotate_for_orientation(image, angle):
@@ -273,6 +267,7 @@ def get_face_landmarker():
                 _face_landmarker = FaceLandmarker.create_from_options(
                     options
                 )
+                print_memory("AFTER MEDIAPIPE MODEL LOAD")
 
                 print("✅ MediaPipe Face Landmarker initialized")
 
@@ -359,6 +354,7 @@ def score_mediapipe_orientation_angle(image, angle):
 
     with _face_landmarker_lock:
         result = landmarker.detect(mp_image)
+    print_memory("AFTER MEDIAPIPE INFERENCE")
 
     if not result.face_landmarks:
         return {
@@ -412,21 +408,18 @@ def detect_image_orientation(original_image, content_bytes=None):
                 "candidates": []
             }
 
-    # STEP 2: EXIF unavailable, use AI
-    resized_image = resize_for_orientation_detection(
-        original_image,
-        max_size=1600
-    )
-
     try:
-        return _detect_image_orientation_resized(resized_image)
+        return _detect_image_orientation(
+               original_image,
+               content_bytes=content_bytes
+        )
 
     finally:
-        del resized_image
+        del original_image
 
 
 
-def _detect_image_orientation_resized(image, content_bytes=None):
+def _detect_image_orientation(image, content_bytes=None):
 
     candidates = []
     mediapipe_candidates = []
@@ -859,11 +852,22 @@ class FaceSearcher:
     def __init__(self, min_similarity: float = 0.3):
         self.min_similarity = min_similarity
 
+        session_options = ort.SessionOptions()
+        session_options.intra_op_num_threads = 2
+        session_options.inter_op_num_threads = 1
+        session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+
+        session_options.enable_cpu_mem_arena = False
+        session_options.enable_mem_pattern = False
+
         self.app = FaceAnalysis(
-            name="buffalo_s",
-            providers=["CPUExecutionProvider"],
-        )
+        name="buffalo_s",
+        allowed_modules=["detection", "recognition", "landmark_3d_68"],
+        providers=["CPUExecutionProvider"],
+        sess_options=session_options,
+    )
         self.app.prepare(ctx_id=0, det_size=(640, 640))
+        print_memory("AFTER INSIGHTFACE LOAD")
 
     def build_s3_prefix(
         self,
@@ -1410,7 +1414,6 @@ BLUR_THRESHOLD = 300.0
 # MOBILENETV3 ONNX MODEL INITIALIZATION
 # =========================================================
 
-import onnxruntime as ort
 
 MODEL_PATH = os.path.join(
     os.path.dirname(__file__),
@@ -1421,6 +1424,10 @@ MODEL_PATH = os.path.join(
 session_options = ort.SessionOptions()
 session_options.intra_op_num_threads = 2
 session_options.inter_op_num_threads = 1
+
+session_options.enable_cpu_mem_arena = False
+session_options.enable_mem_pattern = False
+
 session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
 mobilenet_session = ort.InferenceSession(
@@ -1431,6 +1438,7 @@ mobilenet_session = ort.InferenceSession(
 
 MOBILENET_INPUT = mobilenet_session.get_inputs()[0].name
 MOBILENET_OUTPUT = mobilenet_session.get_outputs()[0].name
+print_memory("AFTER MOBILENET LOAD")
 
 print("✅ MobileNetV3 loaded successfully")
  
@@ -1512,7 +1520,7 @@ def is_side_face(face_obj):
         print(f"⚠️ is_side_face check failed: {e}")
         return False
 
-def is_real_human_face_batch(face_crops, threshold=0.70, batch_size=32):
+def is_real_human_face_batch(face_crops, threshold=0.70, batch_size=8):
     results = []
 
     for start in range(0, len(face_crops), batch_size):
@@ -2009,6 +2017,9 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                 f"| Images: {len(keys)}"
             )
 
+            print_memory(f"BATCH {batch_number} - BEFORE IMAGE LOAD")
+
+
             imgs = [read_s3_image(k) for k in keys]
 
             batch_images = {
@@ -2016,6 +2027,8 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                 for key, img in zip(keys, imgs)
                 if img is not None
             }
+
+            print_memory(f"BATCH {batch_number} - AFTER IMAGE LOAD")
 
             batch_candidates = []
 
@@ -2092,6 +2105,9 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
                         "face_h": face_h,
                     })
 
+            print_memory(f"BATCH {batch_number} - AFTER INSIGHTFACE")
+
+
             if not batch_candidates:
                 print("⚠️ No face candidates in this batch")
 
@@ -2112,6 +2128,8 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
             ]
 
             human_results = is_real_human_face_batch(crops)
+
+            print_memory(f"BATCH {batch_number} - AFTER MOBILENET")
 
             valid_candidates = []
 
@@ -2471,6 +2489,8 @@ def process_face_clustering_in_background(image_keys, folderId, userId, folder_n
 
             gc.collect()
 
+            print_memory(f"BATCH {batch_number} - AFTER CLEANUP")
+
         # =====================================================
         # STAGE 7: FINAL DB SAVE
         # =====================================================
@@ -2796,3 +2816,4 @@ async def serve_index():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+    print_memory("SERVER START")
